@@ -47,6 +47,35 @@ fn same_file_whatever_the_core_count() {
 }
 
 #[test]
+fn crf_h264_coded_gop_by_gop_in_parallel_is_the_serial_file() {
+    // CRF: the encoder codes its 5-picture GOPs concurrently and returns their packets late, yet the
+    // file is byte for byte the one of the serial encoder, whatever the cores and the steps
+    let settings = |name: &str| ExportSettings {
+        format: Format::H264,
+        path: tmp(&format!("{name}.mp4")),
+        bitrate_mode: BitrateMode::Crf,
+        crf: 23.0,
+        keyframe_distance: Some(5),
+        ..Default::default()
+    };
+    SERIAL_H264.with(|s| s.set(true));
+    let reference = export_stepped(7, &settings("crf-serial"));
+    SERIAL_H264.with(|s| s.set(false));
+    for threads in [2, 3, 5, 16] {
+        let other = export_with_cores(threads, &settings(&format!("crf-{threads}")));
+        assert!(reference == other, "CRF: {threads} cores give a different file than the serial encoder");
+    }
+    for batch in [1, 7] {
+        let other = export_stepped(batch, &settings(&format!("crf-b{batch}")));
+        assert!(reference == other, "CRF: {batch} frame(s) per step give a different file than the serial encoder");
+    }
+    for (threads, batch) in [(2, 1), (5, 7), (16, 24)] {
+        let (other, _) = export_overlapped(threads, batch, true, &settings(&format!("crf-ov-{threads}-{batch}")));
+        assert!(reference == other, "CRF: rendering ahead ({threads} cores, {batch} per step) gives a different file");
+    }
+}
+
+#[test]
 fn an_export_adds_up_the_wall_time_of_its_stages() {
     let before: Vec<(Stage, u64)> = stage_times();
     let s = ExportSettings { format: Format::H264, path: tmp("stages.mp4"), ..Default::default() };

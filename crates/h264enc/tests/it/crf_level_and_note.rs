@@ -34,7 +34,7 @@ fn first_access_unit_carries_the_settings() {
     let mut enc = crf(w as u32, h as u32, 30, 18.0);
     let f = synth(w, h, 0);
     let mut packets = enc.encode(&f.frame(), 0).unwrap();
-    packets.extend(enc.flush());
+    packets.extend(enc.flush().unwrap());
     let text = |p: &Packet| String::from_utf8_lossy(&p.data).into_owned();
     let first = text(&packets[0]);
     for want in ["filmcraft-h264enc", "rc=crf crf=18.0", "profile=high", "level=", "bframes=2", "cabac=1"] {

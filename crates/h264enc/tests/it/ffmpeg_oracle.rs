@@ -33,7 +33,7 @@ fn encode(c: EncoderConfig, frames: &[Yuv]) -> Run {
     for (i, f) in frames.iter().enumerate() {
         packets.extend(enc.encode(&f.frame(), i as i64).unwrap());
     }
-    packets.extend(enc.flush());
+    packets.extend(enc.flush().unwrap());
     let mut recon = enc.take_recon();
     recon.sort_by_key(|r| r.pts);
     let stream = packets.iter().flat_map(|p| p.data.iter().copied()).collect();
@@ -227,7 +227,7 @@ fn two_pass_vbr_hits_target() {
     for (i, f) in frames.iter().enumerate() {
         enc.encode(&f.frame(), i as i64).unwrap();
     }
-    enc.flush();
+    enc.flush().unwrap();
     let stats = enc.pass_stats().unwrap();
     assert_eq!(stats.frames.len(), n);
     let p1: u64 = stats.frames.iter().map(|f| f.bits).sum();
@@ -301,7 +301,7 @@ fn length_prefixed_with_avcc() {
     for (i, f) in frames.iter().enumerate() {
         packets.extend(enc.encode(&f.frame(), i as i64).unwrap());
     }
-    packets.extend(enc.flush());
+    packets.extend(enc.flush().unwrap());
     // convert to Annex-B using the avcC parameter sets
     let mut stream = Vec::new();
     for nal in [sps, pps] {

@@ -763,6 +763,13 @@ pub trait VideoEncoder: Send {
     fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
         None
     }
+    /// How many packets the encoder would have returned by now (over all calls) if it coded one
+    /// picture batch at a time, when it returns them later (the GOP-parallel H.264 encoder): the
+    /// export interleaves video and audio by this count so the file does not depend on when the
+    /// background work finishes. `None`: every packet returned so far.
+    fn packets_due(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Audio encoder (AAC) plugged in by codec crates; PCM is built in.
@@ -1551,8 +1558,11 @@ impl VideoEncoder for H264Encoder {
         Ok(self.packets(ps))
     }
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        let ps = self.enc.flush();
+        let ps = self.enc.flush().map_err(|e| ExportError::Encode(e.to_string()))?;
         Ok(self.packets(ps))
+    }
+    fn packets_due(&self) -> Option<u64> {
+        Some(self.enc.packets_due())
     }
     fn media_start(&self) -> Option<i64> {
         // With B-frames the first DTS is one frame before the first PTS.
@@ -1686,6 +1696,13 @@ pub(crate) fn h264_slices(height: u32) -> usize {
     (height.div_ceil(16) as usize).div_ceil(4).max(1)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests build the H.264 encoder on its serial path (no GOP-parallel coding) on this thread,
+    /// to compare files with the default.
+    pub(crate) static SERIAL_H264: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
     if format != Format::H264 {
         return None;
@@ -1696,6 +1713,10 @@ fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSetti
     cfg.aud = s.format.is_mxf();
     cfg.keyint = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (rate.num as f64 / rate.den as f64 * 2.0).round().max(1.0) as u32);
     cfg.slices = h264_slices(h);
+    #[cfg(test)]
+    if SERIAL_H264.with(std::cell::Cell::get) {
+        cfg.parallel_gops = false;
+    }
     let kbps = s.bitrate_kbps.max(100);
     let max = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or_else(|| (u64::from(kbps) * 3 / 2).min(u64::from(u32::MAX)) as u32);
     cfg.rate = match s.bitrate_mode {

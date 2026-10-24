@@ -69,6 +69,13 @@ impl Frame {
     }
 }
 
+/// Bytes of a [`Frame`] of `w` x `h` (macroblock-aligned) luma samples, padding included.
+#[cfg(feature = "threads")]
+pub fn frame_bytes(w: usize, h: usize) -> usize {
+    let plane = |w: usize, h: usize, pad: usize| (w + 2 * pad).saturating_mul(h + 2 * pad);
+    plane(w, h, LUMA_PAD).saturating_add(plane(w / 2, h / 2, CHROMA_PAD).saturating_mul(2))
+}
+
 /// A decoded reference picture with half-sample planes for fast sub-pel access.
 pub struct RefPic {
     pub frame: Frame,
