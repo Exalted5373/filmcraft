@@ -201,6 +201,11 @@ impl State {
         let mut proc: CUVIDPROCPARAMS = unsafe { std::mem::zeroed() };
         proc.progressive_frame = 1;
         proc.top_field_first = info.top_field_first;
+        // SAFETY: as in `readback`: the boxed device outlives the state and is only shared.
+        let device = unsafe { self.device.as_ref() }.ok_or("NVDEC CUDA device is missing")?;
+        // the picture's post-processing on the stream its readback uses, not the default stream
+        // (which would wait for the pictures NVENC is encoding on the same context)
+        proc.output_stream = device.readback_stream();
         let (mut address, mut pitch) = (0u64, 0u32);
         // SAFETY: the validated picture index belongs to the live decoder. Both output
         // pointers and proc are writable, and Session has pushed the context on this thread.
@@ -229,16 +234,16 @@ impl State {
             return Err("NVDEC output queue exceeds its memory limit".into());
         }
         address.checked_add(u64::try_from(total).map_err(|_| "NVDEC mapped size overflows")?).ok_or("NVDEC mapped address overflows")?;
-        let mut host = Vec::new();
-        host.try_reserve_exact(total).map_err(|e| format!("NVDEC readback allocation failed: {e}"))?;
-        host.resize(total, 0);
-        // SAFETY: Session's separately boxed device outlives State and every synchronous callback;
-        // it is immutable, and the CUDA context is current. No mutable Device references exist.
+        // SAFETY: Session's separately boxed device outlives State and every synchronous callback,
+        // and only shared references to it exist (its staging buffer sits behind a `RefCell`). The
+        // CUDA context is current.
         let device = unsafe { self.device.as_ref() }.ok_or("NVDEC CUDA device is missing")?;
-        device.copy_to_host(address, &mut host)?;
-        let luma = host.get(..luma_size).ok_or("NVDEC luma range is invalid")?;
-        let chroma = host.get(luma_size..).ok_or("NVDEC chroma range is invalid")?;
-        to_frame(&Biplanar { luma, chroma, stride: pitch as usize, rows: self.coded.1 as usize }, &self.geometry)
+        let rows = self.coded.1 as usize;
+        device.with_host_copy(address, total, |host| {
+            let luma = host.get(..luma_size).ok_or("NVDEC luma range is invalid")?;
+            let chroma = host.get(luma_size..).ok_or("NVDEC chroma range is invalid")?;
+            to_frame(&Biplanar { luma, chroma, stride: pitch as usize, rows }, &self.geometry)
+        })?
     }
 }
 fn mapped_layout(coded: (u32, u32), bits: u32, pitch: u32) -> Result<(usize, usize), String> {

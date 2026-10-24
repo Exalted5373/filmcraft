@@ -83,7 +83,11 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   run time; without them (or without a device) nothing is registered. NVIDIA's own parser takes the
   stream as Annex B access units, so there is no host-side DPB: `cuvid::Session` creates the decoder
   in the parser's sequence callback, decodes in its picture callback, and reads each displayed
-  picture back (NV12 / P016) through the CUDA driver into the same planes as the other backends.
+  picture back (NV12 / P016) through the CUDA driver into the same planes as the other backends:
+  into a page-locked buffer the session keeps (`cuMemAllocHost`), on a non-blocking stream of its
+  own that the picture's post-processing also runs on (on the default stream it waited for the
+  pictures NVENC was encoding on the same primary context); ordinary memory and the default stream
+  where the driver gives neither.
   The factory goes in front of VA-API's: what NVDEC declines still reaches VA-API (another GPU),
   then the software decoders. With both registered, `perf.stats` names NVDEC as the hardware
   backend, also for the streams VA-API decodes. The callback state is a `Box::into_raw` allocation
