@@ -448,6 +448,15 @@ of 8 s of a 1080p23.976 H.264 clip (191 frames) to H.264 with the default preset
 
 Quality at equal bitrate: see the PR description.
 
+### On by default
+
+Export ▸ Hardware encoding is Auto by default, as Premiere Pro and Media Encoder ship it ("Hardware
+Encoding is the default", falling back to software where the settings are not supported). Where the
+machine has no hardware H.264 encoder, or the encoder declines the settings, the built-in encoder
+runs exactly as before; Off keeps the built-in encoder everywhere, and its byte-identical output.
+On a 24-core laptop with an NVIDIA RTX 50 series GPU (Linux), 8 s of 1080p23.976 H.264 + AAC with the
+default preset: 5.0–6.1 s with the built-in encoder, 1.7–1.8 s with NVENC.
+
 ## Results (HW2 follow-up: Windows VP9 and AV1 hardware decoding, Off → Auto)
 
 Same machine and method as the H.264 / HEVC results above (Xeon E5-2680 v4, RTX 5060 driver 617.14,

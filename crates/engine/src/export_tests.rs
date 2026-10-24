@@ -572,11 +572,11 @@ fn jobs_and_queue_items_report_the_time_they_have_left() {
 }
 
 #[test]
-fn hardware_encoding_is_off_unless_asked_for() {
+fn hardware_encoding_is_auto_unless_turned_off() {
     use filmcraft_export::HardwareEncoding::{Auto, Off};
     let s = demo();
     let setting = |p: Value| crate::export_tools::settings_from_params(&s, &p, "file.exportMedia").map(|(_, st)| st.hardware_encoding);
-    assert_eq!(setting(json!({"path": "x.mp4"})).unwrap(), Off);
+    assert_eq!(setting(json!({"path": "x.mp4"})).unwrap(), Auto);
     assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": "auto"})).unwrap(), Auto);
     assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": "off"})).unwrap(), Off);
     // a boolean is understood too: true is auto
@@ -586,9 +586,9 @@ fn hardware_encoding_is_off_unless_asked_for() {
     let e = setting(json!({"path": "x.mp4", "hardwareEncoding": "gpu"})).unwrap_err().to_string();
     assert!(e.contains("off | auto"), "{e}");
     // and it travels in the settings object, with the default filling in when it is missing
-    assert_eq!(setting(json!({"path": "x.mp4", "settings": {"hardwareEncoding": "auto"}})).unwrap(), Auto);
+    assert_eq!(setting(json!({"path": "x.mp4", "settings": {"hardwareEncoding": "off"}})).unwrap(), Off);
     let old: filmcraft_export::ExportSettings = serde_json::from_value(json!({"format": "h264"})).unwrap();
-    assert_eq!(old.hardware_encoding, Off);
+    assert_eq!(old.hardware_encoding, Auto);
 }
 
 #[test]
