@@ -56,6 +56,9 @@ fn encode(cfg: EncoderConfig, frames: &[Yuv], flush_after: &[usize], capture_fro
     Run { packets, recon, calls, parallel: enc.gop_parallel() }
 }
 
+/// Assert that both runs gave the same packets and reconstructions, that the serial run returned
+/// exactly the packets due after every call, and that the parallel one never returned more and had
+/// returned them all by the end.
 fn assert_same(name: &str, serial: &Run, par: &Run) {
     assert_eq!(serial.packets.len(), par.packets.len(), "{name}: packet count");
     for (i, (a, b)) in serial.packets.iter().zip(&par.packets).enumerate() {
@@ -94,6 +97,9 @@ fn nal_types(data: &[u8]) -> Vec<u8> {
     t
 }
 
+/// CRF and constant QP give the serial path's packets and reconstructions over 0–3 B-frames, every
+/// profile, 1 and 4 slices, `keyint` 5 and 250, both packet formats, HDR SEI, flushes and late
+/// reconstruction capture, with the identification SEI in the first access unit only.
 #[test]
 fn gop_parallel_matches_serial() {
     let (w, h, n) = (176, 144, 30);
@@ -151,6 +157,8 @@ fn gop_parallel_matches_serial() {
     }
 }
 
+/// 320x240 in 15 slices with three B-frames and the default `keyint` gives the serial path's
+/// output.
 #[test]
 fn larger_pictures_many_slices_default_keyint() {
     // 320x240: 15 macroblock rows in 15 slices, scene cuts make the GOPs
@@ -169,6 +177,8 @@ fn larger_pictures_many_slices_default_keyint() {
     }
 }
 
+/// CBR and VBR, in one pass and in both passes of two, take the serial path; CRF and constant QP
+/// do not.
 #[test]
 fn bitrate_modes_take_the_serial_path() {
     let enc = |rate: RateControl, pass: Pass| {
@@ -188,6 +198,8 @@ fn bitrate_modes_take_the_serial_path() {
     assert!(enc(RateControl::Qp(23), Pass::Single));
 }
 
+/// The encoder stays serial when GOP-parallel coding is switched off, with one thread, or when
+/// two GOPs of `keyint` pictures pass the picture budget.
 #[test]
 fn serial_when_asked_single_threaded_or_over_the_budget() {
     let enc = |w: u32, h: u32, keyint: u32, threads: usize, on: bool| {
@@ -207,6 +219,7 @@ fn serial_when_asked_single_threaded_or_over_the_budget() {
     assert!(!enc(3840, 2160, 60, 4, true), "4K, keyint 60");
 }
 
+/// The first-pass statistics of a CRF encode are the same on the GOP-parallel and serial paths.
 #[test]
 fn crf_first_pass_statistics_follow_coding_order() {
     let frames = scenes(176, 144, 30);
@@ -228,6 +241,8 @@ fn crf_first_pass_statistics_follow_coding_order() {
     assert_eq!(stats(true), stats(false));
 }
 
+/// A refused input picture between good ones loses none of the packets coded so far: the stream is
+/// the serial one.
 #[test]
 fn a_short_frame_keeps_the_packets_of_finished_gops() {
     let frames = scenes(176, 144, 20);

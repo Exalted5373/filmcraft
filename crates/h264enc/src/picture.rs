@@ -59,9 +59,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// A zeroed frame of `w` x `h` luma samples with padded planes.
     pub fn new(w: usize, h: usize) -> Self {
         Frame { y: Plane::new(w, h, LUMA_PAD), u: Plane::new(w / 2, h / 2, CHROMA_PAD), v: Plane::new(w / 2, h / 2, CHROMA_PAD) }
     }
+    /// Replicate the edge samples of every plane into its padding.
     pub fn extend_edges(&mut self) {
         self.y.extend_edges();
         self.u.extend_edges();

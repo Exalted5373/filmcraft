@@ -29,6 +29,8 @@ fn export_stepped(batch: i64, settings: &ExportSettings) -> Vec<u8> {
     std::fs::read(&settings.path).unwrap()
 }
 
+/// ProRes, H.264 and MJPEG exports give the same bytes on 2, 3, 5 and 16 cores and with 1 or 7
+/// frames per step.
 #[test]
 fn same_file_whatever_the_core_count() {
     // 24 frames: one full interleave group and a partial one
@@ -46,6 +48,8 @@ fn same_file_whatever_the_core_count() {
     }
 }
 
+/// A CRF H.264 export, coded GOP by GOP in parallel, is byte for byte the file of the serial
+/// encoder on any number of cores, with any number of frames per step and when rendering ahead.
 #[test]
 fn crf_h264_coded_gop_by_gop_in_parallel_is_the_serial_file() {
     // CRF: the encoder codes its 5-picture GOPs concurrently and returns their packets late, yet the
@@ -75,6 +79,7 @@ fn crf_h264_coded_gop_by_gop_in_parallel_is_the_serial_file() {
     }
 }
 
+/// An export adds its time to the wall-time counter of every stage, and each stage has a counter.
 #[test]
 fn an_export_adds_up_the_wall_time_of_its_stages() {
     let before: Vec<(Stage, u64)> = stage_times();

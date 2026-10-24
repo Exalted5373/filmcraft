@@ -9,6 +9,9 @@ mod common;
 use filmcraft_h264enc::*;
 use std::time::Instant;
 
+/// Encode the pictures the arguments describe and print speed, bitrate and the first packets; then
+/// (with ffmpeg, and not on a `PERF` run) decode the stream, report each picture where the decode
+/// first differs from the encoder's reconstruction, and the mean luma PSNR against the source.
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let arg = |i: usize, d: &str| a.get(i).cloned().unwrap_or_else(|| d.to_string());

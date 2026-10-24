@@ -6,6 +6,7 @@ use crate::common;
 use common::synth;
 use filmcraft_h264enc::*;
 
+/// A length-prefixed encoder of `w` x `h` at `fps` pictures a second with constant quality `f`.
 fn crf(w: u32, h: u32, fps: u32, f: f32) -> Encoder {
     let mut c = EncoderConfig::new(w, h, fps, 1);
     c.rate = RateControl::Crf(f);
@@ -13,6 +14,8 @@ fn crf(w: u32, h: u32, fps: u32, f: f32) -> Encoder {
     Encoder::new(c).unwrap()
 }
 
+/// The level of a CRF stream follows the factor (low factors need the bitrate of a higher level),
+/// never drops below what the picture size and rate need, and treats a hostile factor as in range.
 #[test]
 fn crf_level_allows_the_bitrate_of_the_factor() {
     let level = |w, h, fps, f| crf(w, h, fps, f).avcc()[3];
@@ -28,6 +31,7 @@ fn crf_level_allows_the_bitrate_of_the_factor() {
     assert_eq!(level(1920, 1080, 30, -100.0), 51);
 }
 
+/// The first access unit carries the identification SEI with the settings, and no later one does.
 #[test]
 fn first_access_unit_carries_the_settings() {
     let (w, h) = (64, 48);

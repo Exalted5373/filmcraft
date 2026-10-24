@@ -238,6 +238,9 @@ impl Exporter {
         timed(Stage::Setup, || Self::set_up(project, seq, settings, progress))
     }
 
+    /// The work of [`Exporter::new`]: validate the settings, pick the colour signalling, bake the
+    /// derived bitrate and keyframe values in, and create the pipeline, the video and audio encoders
+    /// and the audio mixer (the container writer comes once the first group is encoded).
     fn set_up(project: Arc<Project>, seq: ItemId, settings: &ExportSettings, progress: &Progress) -> Result<Self> {
         if !stepped(settings.format) {
             return Err(ExportError::Unsupported(format!("{} is not a stepped export", settings.format.label())));
@@ -362,10 +365,13 @@ impl Exporter {
         if self.overlapping() { overlap_batch(batch, frame_bytes(self.pipe.w, self.pipe.h, self.pipe.hdr_out), self.budget) } else { batch }
     }
 
+    /// The audio sample at rate `sr` where frame `f` starts, rounded down.
     fn sample_at_frame(&self, f: i64, sr: u32) -> i64 {
         self.pipe.rate.tick_of(f).to_units_floor(sr as i64)
     }
 
+    /// Write the mixed audio of an interleave group: to the MXF writer, or to the audio track,
+    /// encoded (AAC, FLAC) or as little-endian PCM. Nothing to write without audio.
     fn write_audio(&mut self, planar: Option<Vec<Vec<f32>>>) -> Result<()> {
         if let Some(m) = self.mxf.as_mut() {
             return match planar {
@@ -397,6 +403,7 @@ impl Exporter {
         Ok(())
     }
 
+    /// Write encoded video packets, in order, to the container (or the MXF writer).
     fn write_video(&mut self, packets: Vec<EncodedPacket>) -> Result<()> {
         if let Some(m) = self.mxf.as_mut() {
             return m.write_video(packets);
@@ -409,6 +416,8 @@ impl Exporter {
         Ok(())
     }
 
+    /// Take packets from the video encoder: they wait in `queued` until their interleave group is
+    /// written.
     fn receive(&mut self, packets: Vec<EncodedPacket>) {
         self.received += packets.len() as u64;
         self.queued.extend(packets);
@@ -701,6 +710,7 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
+    /// A frame in flight takes 4 bytes a pixel in SDR and 12 in HDR, saturating, none when empty.
     #[test]
     fn frame_bytes_by_format() {
         assert_eq!(frame_bytes(1920, 1080, false), 1920 * 1080 * 4);
@@ -709,6 +719,9 @@ mod tests {
         assert_eq!(frame_bytes(0, 1080, false), 0);
     }
 
+    /// The overlap batch never asks for more than the batch or fewer than one frame, handles
+    /// degenerate sizes, and keeps two batches in flight within the budget unless one frame alone
+    /// passes it.
     #[test]
     fn the_overlap_batch_fits_the_memory_budget() {
         let budget = IN_FLIGHT_BUDGET;
@@ -749,12 +762,15 @@ mod tests {
     }
 
     impl VideoEncoder for Late {
+        /// The wrapped encoder's sample entry.
         fn sample_entry(&self) -> SampleEntry {
             self.inner.sample_entry()
         }
+        /// The wrapped encoder's timescale.
         fn timescale(&self) -> u32 {
             self.inner.timescale()
         }
+        /// Encode with the wrapped encoder, holding its packets back until every 11th picture.
         fn encode(&mut self, frame: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
             let p = self.inner.encode(frame)?;
             self.due += p.len() as u64;
@@ -762,20 +778,26 @@ mod tests {
             self.pictures += 1;
             Ok(if self.pictures.is_multiple_of(11) { std::mem::take(&mut self.held) } else { Vec::new() })
         }
+        /// Flush the wrapped encoder and hand over every packet held.
         fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
             let p = self.inner.flush()?;
             self.due += p.len() as u64;
             self.held.extend(p);
             Ok(std::mem::take(&mut self.held))
         }
+        /// The wrapped encoder's media start.
         fn media_start(&self) -> Option<i64> {
             self.inner.media_start()
         }
+        /// The packets the wrapped encoder returned so far: what a serial encode would have
+        /// handed over by now.
         fn packets_due(&self) -> Option<u64> {
             Some(self.due)
         }
     }
 
+    /// H.264 and ProRes exports write the same file when the encoder hands its packets over late:
+    /// the interleave groups wait for their video, as `packets_due` says.
     #[test]
     fn late_packets_keep_the_interleave_of_a_serial_encode() {
         for (format, ext) in [(Format::H264, "mp4"), (Format::ProRes, "mov")] {

@@ -184,6 +184,9 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// Defaults for a `width` x `height` stream at `fps_num / fps_den` pictures a second: High
+    /// profile, balanced preset, CRF 23, `keyint` 250, two B-frames, every core, Annex B with
+    /// access unit delimiters, GOP-parallel coding allowed.
     pub fn new(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Self {
         EncoderConfig {
             width,
@@ -265,6 +268,7 @@ struct Pool {
 }
 
 impl Pool {
+    /// Run `f` on the encoder's pool, or on this thread when there is none.
     fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
         #[cfg(feature = "threads")]
         if let Some(p) = &self.pool {
@@ -312,22 +316,26 @@ struct Refs {
 }
 
 impl Refs {
+    /// A picture buffer of the padded size, from the pool or new.
     fn new_frame(&mut self, p: &EncParams) -> Frame {
         self.frame_pool.pop().unwrap_or_else(|| Frame::new(p.mbw * 16, p.mbh * 16))
     }
 
+    /// Keep a picture buffer for reuse (up to 8).
     fn recycle(&mut self, f: Frame) {
         if self.frame_pool.len() < 8 {
             self.frame_pool.push(f);
         }
     }
 
+    /// Keep a set of half-sample planes for reuse (up to 4).
     fn recycle_hpel(&mut self, h: [picture::Plane; 3]) {
         if self.hpel_pool.len() < 4 {
             self.hpel_pool.push(h);
         }
     }
 
+    /// Keep the picture and half-sample buffers of a reference picture no longer used.
     fn recycle_ref(&mut self, r: RefPic) {
         self.recycle(r.frame);
         self.recycle_hpel(r.hpel);
@@ -489,6 +497,9 @@ impl Ctx {
 }
 
 impl Encoder {
+    /// An encoder for `cfg`: checks the size (even, 2..=16384), frame rate, B-frames and bitrate,
+    /// picks the level, builds the parameter sets, the slice count and the thread pool, and takes
+    /// the GOP-parallel path when the configuration allows it ([`EncoderConfig::parallel_gops`]).
     pub fn new(mut cfg: EncoderConfig) -> Result<Self, Error> {
         if cfg.width == 0 || cfg.height == 0 || !cfg.width.is_multiple_of(2) || !cfg.height.is_multiple_of(2) || cfg.width > 16384 || cfg.height > 16384 {
             return Err(Error::InvalidDimensions(cfg.width, cfg.height));
@@ -665,6 +676,7 @@ impl Encoder {
         })
     }
 
+    /// The configuration the encoder runs with (B-frames off for Baseline, `keyint` at least 1).
     pub fn config(&self) -> &EncoderConfig {
         &self.ctx.cfg
     }
@@ -831,6 +843,8 @@ impl Encoder {
         self.ctx.pool.install(f)
     }
 
+    /// End the pending mini-GOP: its last picture is scheduled as a P picture, then the pictures
+    /// before it as B pictures, together in one batch.
     fn flush_minigop(&mut self) {
         let Some(p) = self.pending.pop_back() else { return };
         let bs: Vec<(Input, SliceType, bool)> = self.pending.drain(..).map(|b| (b, SliceType::B, false)).collect();
@@ -882,6 +896,8 @@ impl Encoder {
         self.held.push(c.packet);
     }
 
+    /// Copy an input picture into a padded picture buffer, repeating its last column and row into
+    /// the padding; [`Error::BadFrame`] when a stride or plane is too small for the configured size.
     fn import(&mut self, f: &YuvFrame) -> Result<Frame, Error> {
         let (w, h) = (self.ctx.cfg.width as usize, self.ctx.cfg.height as usize);
         let (cw, ch) = (w / 2, h / 2);
@@ -1185,10 +1201,12 @@ fn encode_batch(ctx: &Ctx, refs: &mut Refs, frame_qp: &mut dyn FnMut(SliceType, 
     coded
 }
 
+/// Row stride of a padded luma plane `mbw` macroblocks wide.
 fn jobs_stride_y(mbw: usize) -> usize {
     mbw * 16 + 2 * LUMA_PAD
 }
 
+/// Row stride of a padded chroma plane `mbw` macroblocks wide.
 fn jobs_stride_c(mbw: usize) -> usize {
     mbw * 8 + 2 * CHROMA_PAD
 }
