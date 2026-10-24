@@ -218,6 +218,13 @@ impl State {
         self.mapped.set(Some(address));
         let mapped = Mapped { api: self.api, decoder: self.decoder, address, outstanding: &self.mapped, active: true };
         let frame = self.readback(address, pitch);
+        if frame.is_err() && !device.readback_settled() {
+            // The transfer's end could not be established: keep the picture mapped rather than let
+            // the decoder reuse its surface under it. The error stops the session, and its
+            // teardown retries the unmap (`outstanding`).
+            mapped.keep();
+            return frame.map(|_| ());
+        }
         mapped.unmap()?;
         let frame = frame?;
         self.ready.try_reserve(1).map_err(|e| format!("NVDEC output allocation failed: {e}"))?;
@@ -275,6 +282,7 @@ struct Mapped<'a> {
     active: bool,
 }
 impl Mapped<'_> {
+    /// Release the mapping now.
     fn unmap(mut self) -> Result<(), String> {
         self.active = false;
         // SAFETY: this guard owns one successful mapping on this decoder, and the context is
@@ -282,6 +290,11 @@ impl Mapped<'_> {
         status(unsafe { (self.api.unmap)(self.decoder, self.address) }, "cuvidUnmapVideoFrame64")?;
         self.outstanding.set(None);
         Ok(())
+    }
+    /// Leave the picture mapped: it stays `outstanding`, and the session's teardown unmaps it
+    /// before it destroys the decoder.
+    fn keep(mut self) {
+        self.active = false;
     }
 }
 impl Drop for Mapped<'_> {
