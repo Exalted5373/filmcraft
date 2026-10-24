@@ -489,6 +489,9 @@ impl MediaSource for Mp4Source {
         Ok(f)
     }
 
+    /// The ProRes or DNx sample `video_frame` decodes for `time` (same rounding and lookup), with the
+    /// sample description's size and pixel aspect and the colour the frame decodes with. None for
+    /// other codecs and for a track whose frames are cropped or rotated.
     fn compressed_video_sample(&self, time: Tick) -> Result<Option<CompressedSample>, MediaError> {
         let Some(ti) = self.vtrack.filter(|_| !self.display_transform) else { return Ok(None) };
         let Some(track) = self.file.tracks.get(ti) else { return Ok(None) };

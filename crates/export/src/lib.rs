@@ -1265,6 +1265,8 @@ impl VideoEncoder for ProResEncoder {
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
+    /// ProRes of this profile and size, with alpha when the export codes it (4444 profiles), at the
+    /// export's rate and colour.
     fn sample_copy(&self) -> Option<SampleCopy> {
         let alpha = self.alpha && self.profile.chroma() == filmcraft_prores::ChromaFormat::Yuv444;
         let flavour = CopyFlavour::ProRes { profile: self.profile, alpha };
@@ -1444,6 +1446,7 @@ impl VideoEncoder for DnxEncoder {
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
+    /// DNxHR of this profile and depth and size, at the export's rate and colour.
     fn sample_copy(&self) -> Option<SampleCopy> {
         let cfg = self.enc.config();
         let flavour = CopyFlavour::DnxHr { profile: cfg.profile, bit_depth: cfg.bit_depth };

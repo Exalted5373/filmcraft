@@ -462,6 +462,9 @@ impl MediaSource for MxfSource {
         Ok(frame)
     }
 
+    /// The ProRes or VC-3 sample `video_frame` decodes for `time` (its display position), with the
+    /// descriptor's size and pixel aspect and the colour the frame decodes with. None for other
+    /// codings and a track without a decoder.
     fn compressed_video_sample(&self, time: Tick) -> Result<Option<CompressedSample>, MediaError> {
         let Some(ti) = self.vtrack.filter(|_| self.unsupported.is_none() && self.vcount > 0) else { return Ok(None) };
         let Some(track) = self.file.tracks.get(ti) else { return Ok(None) };

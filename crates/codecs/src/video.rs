@@ -756,6 +756,7 @@ pub fn av1_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 pub struct ProResDecoder;
 
 impl VideoDecoder for ProResDecoder {
+    /// Decodes one ProRes frame to 16-bit Y'CbCr (alpha kept) in the colour of [`prores_color`].
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         use std::sync::Arc;
         let f = filmcraft_prores::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;

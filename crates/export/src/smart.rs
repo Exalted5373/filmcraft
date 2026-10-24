@@ -103,6 +103,9 @@ impl SampleCopy {
         }
     }
 
+    /// [`SampleCopy::check`] for a ProRes encoder of `profile`: the profile's fourcc, then the frame
+    /// header (whole frame, size, chroma, progressive, alpha, square pixels, frame rate code, and
+    /// colour codes that are BT.709 or unspecified).
     fn check_prores(&self, s: &CompressedSample, profile: filmcraft_prores::Profile, alpha: bool) -> Result<(), String> {
         use filmcraft_prores::{AlphaType, Interlace};
         if s.codec != IntraCodec::ProRes || s.fourcc != profile.fourcc() {
@@ -144,6 +147,9 @@ impl SampleCopy {
         Ok(())
     }
 
+    /// [`SampleCopy::check`] for a DNxHR encoder of `profile` at `bit_depth`: the `AVdh` fourcc,
+    /// then the frame header (whole frame, compression ID, size, progressive, constant bitrate,
+    /// 4:2:2 Y'CbCr without alpha, depth, BT.709 colour volume, square pixels).
     fn check_dnx(&self, s: &CompressedSample, profile: filmcraft_dnx::Profile, bit_depth: u8) -> Result<(), String> {
         use filmcraft_dnx::{ChromaFormat, ColorVolume, FieldCode};
         if s.codec != IntraCodec::Dnx || s.fourcc != *b"AVdh" {

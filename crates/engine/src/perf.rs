@@ -84,6 +84,8 @@ mod tests {
 
     use crate::Session;
 
+    /// `perf.stats` answers without a project and reports every decode, hardware, smart rendering
+    /// and export stage counter, without adding an undo step.
     #[test]
     fn perf_stats_query_reports_decode_counters() {
         let mut s = Session::default();

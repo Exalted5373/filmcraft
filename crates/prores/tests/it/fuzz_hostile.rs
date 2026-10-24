@@ -40,6 +40,7 @@ fn seeds() -> Vec<Vec<u8>> {
     v
 }
 
+/// Decodes `d` at every output depth, probes and checks it, failing the test if any of them panics.
 fn run(d: &[u8], label: &str) {
     filmcraft_testkit::set_progress(label);
     let res = catch_unwind(AssertUnwindSafe(|| {
@@ -60,6 +61,8 @@ fn hostile_frames_never_panic() {
     filmcraft_testkit::with_deadline(DEADLINE_SECS, sweep);
 }
 
+/// `check_frame` accepts every seed frame, with the header `probe` reads, and refuses it one byte
+/// short, one byte longer, or with a frame size past the sample.
 #[test]
 fn check_frame_takes_whole_frames_only() {
     for (si, seed) in seeds().iter().enumerate() {

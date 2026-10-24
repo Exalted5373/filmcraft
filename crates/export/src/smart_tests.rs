@@ -16,6 +16,7 @@ const H: u32 = 144;
 const RATE: FrameRate = FrameRate::FPS_24;
 const N: usize = 24;
 
+/// `name` in this process's scratch directory, created if needed.
 fn tmp(name: &str) -> String {
     let d = std::env::temp_dir().join(format!("fc-export-smart-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
@@ -92,16 +93,19 @@ fn unlabelled_mov(name: &str, entry: SampleEntry, rate: FrameRate, samples: &[Ve
     (path, src)
 }
 
+/// A `W` x `H` MOV sample description of `profile`, without colour.
 fn prores_entry(profile: filmcraft_prores::Profile) -> SampleEntry {
     SampleEntry::prores(FourCc(profile.fourcc()), W as u16, H as u16)
 }
 
+/// A MOV of `N` ProRes 422 HQ frames at `RATE`, labelled BT.709: its path, source and samples.
 fn hq_source(name: &str) -> (String, SharedSource, Vec<Vec<u8>>) {
     let samples = prores_samples(filmcraft_prores::Profile::Hq, N, false, Default::default());
     let (path, src) = mov(name, prores_entry(filmcraft_prores::Profile::Hq), RATE, &samples);
     (path, src, samples)
 }
 
+/// A media item reading `src`, registered in the source map.
 fn add_item(p: &mut Project, m: &mut SourceMap, name: &str, media: MediaRef, src: SharedSource) -> ItemId {
     let info: MediaInfo = src.info().clone();
     let kind = ItemKind::Media(MediaClip {
@@ -138,14 +142,17 @@ fn project(
     (Arc::new(p), seq, m)
 }
 
+/// A `W` x `H` sequence at `RATE`.
 fn seq_settings() -> SequenceSettings {
     SequenceSettings { width: W, height: H, frame_rate: RATE, ..Default::default() }
 }
 
+/// ProRes export settings of `profile`, without audio, writing `name`.
 fn prores(name: &str, profile: &str) -> ExportSettings {
     ExportSettings { format: Format::ProRes, path: tmp(name), include_audio: false, prores_profile: profile.into(), ..Default::default() }
 }
 
+/// DNxHR export settings of `profile`, without audio, writing `name`.
 fn dnxhr(name: &str, profile: &str) -> ExportSettings {
     ExportSettings { format: Format::DnxHr, path: tmp(name), include_audio: false, dnx_profile: profile.into(), ..Default::default() }
 }
@@ -165,6 +172,7 @@ fn export_with(p: Arc<Project>, seq: ItemId, m: &SourceMap, s: &ExportSettings, 
     (std::fs::read(&s.path).unwrap(), copied)
 }
 
+/// [`export_with`] on four threads, six frames per step, rendering ahead, taking copies.
 fn export(p: Arc<Project>, seq: ItemId, m: &SourceMap, s: &ExportSettings) -> (Vec<u8>, u64) {
     export_with(p, seq, m, s, 4, 6, true, true)
 }
@@ -185,6 +193,7 @@ fn decoded(src: &dyn MediaSource, k: usize) -> Vec<Vec<u16>> {
     planes(&src.video_frame(FrameRequest::full(RATE.tick_of(k as i64))).unwrap())
 }
 
+/// The planes of a decoded Y'CbCr frame as 16-bit values.
 fn planes(f: &filmcraft_frame::VideoFrame) -> Vec<Vec<u16>> {
     match &f.data {
         filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes.iter().map(|p| p.to_vec()).collect(),
@@ -193,6 +202,8 @@ fn planes(f: &filmcraft_frame::VideoFrame) -> Vec<Vec<u16>> {
     }
 }
 
+/// An untouched ProRes HQ clip exported to ProRes HQ is the source's samples, byte for byte, with
+/// the source's timing and fourcc, and the copies are counted for `perf.stats`.
 #[test]
 fn an_untouched_prores_hq_clip_is_copied_sample_for_sample() {
     let (path, src, samples) = hq_source("hq.mov");
@@ -211,6 +222,7 @@ fn an_untouched_prores_hq_clip_is_copied_sample_for_sample() {
     }
 }
 
+/// Sets a float parameter of an effect of clip `clip` on V1.
 fn set(p: &mut Project, seq: ItemId, clip: usize, effect: &str, param: &str, value: f64) {
     let c = &mut p.sequence_mut(seq).unwrap().video_tracks[0].items[clip];
     c.effect_mut(effect).unwrap().param_mut(param).unwrap().value = ParamValue::Float(value);
@@ -235,6 +247,8 @@ fn mixed_edit(p: &mut Project, seq: ItemId, item: ItemId, m: &mut SourceMap) {
 
 const UNTOUCHED: [usize; 6] = [0, 1, 2, 3, 6, 7];
 
+/// Only the frames nothing is drawn on are copied; the others are the same packets as an export
+/// without copies, and the file decodes to the source, the matte and the faded frames.
 #[test]
 fn only_the_frames_nothing_is_drawn_on_are_copied() {
     let (path, src, samples) = hq_source("mixed.mov");
@@ -267,6 +281,8 @@ fn only_the_frames_nothing_is_drawn_on_are_copied() {
     assert!(first_opacity_frame != &decoded(&*src, 8)[0], "frame 8 is at half opacity");
 }
 
+/// The file with copies is the same on any thread count, batch size and with or without
+/// rendering ahead.
 #[test]
 fn the_file_is_the_same_on_any_core_count_and_batch() {
     let (path, src, _) = hq_source("det.mov");
@@ -292,6 +308,8 @@ fn copies(
     export(p, seq, &m, settings).1
 }
 
+/// Nothing is copied into another ProRes profile, frame size or frame rate, from a speed change or
+/// a reversed clip, or into an export that draws on the frame or writes HDR.
 #[test]
 fn a_different_flavour_size_rate_or_timing_is_rendered() {
     let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
@@ -329,6 +347,9 @@ fn a_different_flavour_size_rate_or_timing_is_rendered() {
     assert_eq!(copies(&path, src, hdr, none, &prores("c-hdr.mov", "hq")), 0, "HDR export");
 }
 
+/// ProRes 4444 with alpha is not copied into an export without (or with) alpha, 4444 without alpha
+/// is; a BT.2020 container colour or BT.601 frame headers are not copied, unspecified frame
+/// headers under a BT.709 container are.
 #[test]
 fn alpha_and_colour_must_match_the_export() {
     let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
@@ -360,6 +381,7 @@ fn alpha_and_colour_must_match_the_export() {
     assert_eq!(copies(&path, src, seq_settings(), none, &prores("c-unspec-out.mov", "hq")), N as u64, "unspecified frame colour");
 }
 
+/// DNxHR copies into an export of its own profile only, byte for byte with the source's timing.
 #[test]
 fn dnxhr_copies_into_the_same_profile_only() {
     use filmcraft_dnx::Profile;
@@ -382,6 +404,8 @@ fn dnxhr_copies_into_the_same_profile_only() {
     assert_eq!(copies(&path, src, seq_settings(), none, &dnxhr("dnx-lb-lb.mov", "lb")), N as u64, "LB source, LB export");
 }
 
+/// Truncated, resized, oversized or padded ProRes samples and DNxHR samples of another compression
+/// ID or cut short are rendered instead, and the rest of the export still copies.
 #[test]
 fn damaged_or_lying_samples_are_rendered_and_the_export_succeeds() {
     let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
@@ -418,6 +442,8 @@ fn damaged_or_lying_samples_are_rendered_and_the_export_succeeds() {
     assert!(out[2] != dnx[2] && out[4] != dnx[4]);
 }
 
+/// The sample check accepts the encoders' own samples and returns an error, never a panic, for
+/// truncated and bit-flipped ones.
 #[test]
 fn the_sample_check_survives_hostile_bytes() {
     let copy = SampleCopy {
@@ -467,6 +493,8 @@ fn the_sample_check_survives_hostile_bytes() {
     }
 }
 
+/// [`filmcraft_render::plan::untouched_clip`] finds a frame exactly where `untouched_frame` does,
+/// and names the source frame it returns, through cuts, effects, scaling and speed changes.
 #[test]
 fn untouched_clip_names_the_frame_untouched_frame_returns() {
     use filmcraft_render::RenderOptions;
@@ -499,6 +527,7 @@ fn untouched_clip_names_the_frame_untouched_frame_returns() {
     }
 }
 
+/// Samples of an MXF source are copied into a MOV export as they are stored in the MXF.
 #[test]
 fn an_mxf_source_copies_too() {
     // the HQ source exported to MXF without copies (re-encoded), then that MXF exported to MOV

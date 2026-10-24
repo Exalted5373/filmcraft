@@ -738,8 +738,9 @@ impl Exporter {
         Ok(Encoded::Done)
     }
 
-    /// Encodes frame `f`: 4:2:0 planes converted while rendering go to the encoder as they are, an
-    /// RGBA (or HDR float) picture is converted by the encoder.
+    /// Encodes frame `f`: a copied source sample becomes a packet unchanged, 4:2:0 planes go to the
+    /// encoder as they are, an RGBA (or HDR float) picture is converted by the encoder. Frames of
+    /// an export that takes copies are counted as copied or rendered.
     fn encode(&mut self, frame: Frame, f: i64) -> Result<Vec<EncodedPacket>> {
         let index = (f - self.f0) as u64;
         if self.input.copy.is_some() {
