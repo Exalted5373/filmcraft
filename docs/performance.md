@@ -220,7 +220,8 @@ next step (issue #30).
 ## Results (HW2: VideoToolbox hardware H.264 encoding, built-in → hardware)
 
 Apple M1 (8 cores, 16 GB), 2026-10-06, single runs on an otherwise idle machine, release build.
-Hardware encoding is opt-in per export (`hardware_encoding: auto`); the built-in encoder is unchanged.
+The hardware rows set `hardware_encoding: auto` explicitly (hardware encoding was opt-in then; it is
+the default now); the built-in encoder is unchanged.
 
 ### The encoder alone (100 frames of 1920×1080 25 fps camera footage, High, one-pass VBR, keyframe every 50)
 

@@ -530,6 +530,8 @@ fn queue_cancels_a_running_export_and_retries_a_failed_one() {
     assert!(queue(&mut s).iter().all(|i| i["id"] != bad));
 }
 
+/// A running job and the queue item encoding it report the seconds left from their speed so far;
+/// a waiting item reports none, and `jobs.list` carries the estimate too.
 #[test]
 fn jobs_and_queue_items_report_the_time_they_have_left() {
     use std::sync::atomic::Ordering;
@@ -571,6 +573,9 @@ fn jobs_and_queue_items_report_the_time_they_have_left() {
     assert!(listed["etaSeconds"].as_f64().is_some(), "{listed}");
 }
 
+/// Hardware encoding is Auto unless the parameters or the settings turn it off (`off`, `false`),
+/// an older settings document without the field reads as Auto, and anything else is an error that
+/// names the choices.
 #[test]
 fn hardware_encoding_is_auto_unless_turned_off() {
     use filmcraft_export::HardwareEncoding::{Auto, Off};

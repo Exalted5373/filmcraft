@@ -677,8 +677,11 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
 - **Reproducible.** The same project and settings give the same file on every machine. Frames render
   in batches of one per core, but the muxer gets them in fixed groups of 16 output frames
   (`INTERLEAVE` in `crates/export/src/job.rs`), each followed by its audio, and H.264 uses one slice
-  per four macroblock rows instead of one per core. MXF files are the exception: their UMIDs and
-  modification date come from the clock, as SMPTE ST 330 / ST 377 expect.
+  per four macroblock rows instead of one per core. The exceptions: MXF files, whose UMIDs and
+  modification date come from the clock, as SMPTE ST 330 / ST 377 expect, and exports that a
+  hardware encoder takes (H.264 with Hardware encoding Auto, the default, on a machine that has
+  one; H.265), whose streams depend on the GPU and driver. Hardware encoding Off keeps H.264 on the
+  built-in encoder and its byte-identical files.
 - **Settings.** `ExportSettings` (serde, camelCase, every field optional) holds Video (frame size or
   Match Source, frame rate, Scale to Fit / Fill / Stretch, pixel aspect, field order — progressive
   only, profile / level, bitrate encoding, target / maximum / adaptive bitrate, keyframe distance,
