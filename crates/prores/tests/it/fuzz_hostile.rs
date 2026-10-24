@@ -47,6 +47,7 @@ fn run(d: &[u8], label: &str) {
             let _ = decode_frame_with(d, &DecodeOptions { bit_depth: depth, threads: depth.is_none() });
         }
         let _ = probe(d);
+        let _ = check_frame(d);
     }));
     assert!(res.is_ok(), "panic: {label}");
 }
@@ -57,6 +58,22 @@ const DEADLINE_SECS: u64 = 600;
 #[test]
 fn hostile_frames_never_panic() {
     filmcraft_testkit::with_deadline(DEADLINE_SECS, sweep);
+}
+
+#[test]
+fn check_frame_takes_whole_frames_only() {
+    for (si, seed) in seeds().iter().enumerate() {
+        let h = check_frame(seed).unwrap_or_else(|e| panic!("seed {si}: {e}"));
+        assert_eq!(h, probe(seed).unwrap());
+        assert!(check_frame(&seed[..seed.len() - 1]).is_err(), "seed {si}: one byte short");
+        let mut longer = seed.clone();
+        longer.push(0);
+        assert!(check_frame(&longer).is_err(), "seed {si}: one byte appended");
+        // the frame size in the frame header grows past the sample
+        let mut lying = seed.clone();
+        lying[0..4].copy_from_slice(&(seed.len() as u32 + 1).to_be_bytes());
+        assert!(check_frame(&lying).is_err(), "seed {si}: frame size past the sample");
+    }
 }
 
 fn sweep() {

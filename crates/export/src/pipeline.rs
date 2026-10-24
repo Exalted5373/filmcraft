@@ -12,7 +12,7 @@ use filmcraft_time::FrameRate;
 use rayon::prelude::*;
 
 use crate::settings::{ExportEffects, Placement, Scaling, TextOverlay};
-use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, Yuv420, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
+use crate::{ExportError, ExportSettings, FrameRenderer, GpuRendering, Result, SampleCopy, Yuv420, build_frame_renderer, note_gpu_fallback, note_gpu_frame};
 
 /// Where the rendered picture lands in the output frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -319,6 +319,45 @@ impl Pipeline {
         }
         let frame = filmcraft_render::plan::untouched_frame(&self.project, self.seq, t, self.opts, sources)?;
         yuv420_of(&frame, self.w, self.h)
+    }
+
+    /// Output frame `f` as the source's compressed sample, unchanged, when the export draws nothing
+    /// on it, the timeline shows one source frame untouched
+    /// ([`filmcraft_render::plan::untouched_clip`]), the clip plays its source forward at 100 %
+    /// and at the output frame rate, and the sample the source would decode for it passes the
+    /// encoder's check ([`SampleCopy::check`]). Nothing is decoded. None for every other frame
+    /// (rendered and encoded instead); why a candidate was not copied goes to the debug log.
+    pub fn copied_sample(&self, f: i64, sources: &dyn SourceProvider, copy: &SampleCopy) -> Option<Vec<u8>> {
+        if !self.passthrough {
+            return None;
+        }
+        let t = self.rate.tick_of(f);
+        let found = filmcraft_render::plan::untouched_clip(&self.project, self.seq, t, self.opts, sources)?;
+        let clip = found.clip;
+        let refuse = |why: &str| {
+            log::debug!("smart render: frame {f} ({}) rendered: {why}", clip.name);
+            None
+        };
+        if (clip.speed - 1.0).abs() > 1e-9 || clip.reverse || clip.frame_hold.is_some() {
+            return refuse("speed change, reverse or frame hold");
+        }
+        let src = sources.source(clip.item)?;
+        let src_rate = src.info().frame_rate();
+        if !crate::smart::same_rate(src_rate, self.rate) {
+            return refuse(&format!("source at {src_rate:?}, export at {:?}", self.rate));
+        }
+        let sample = match src.compressed_video_sample(found.time) {
+            Ok(Some(s)) => s,
+            Ok(None) => return refuse("the source has no intra-only samples to hand out"),
+            Err(e) => return refuse(&format!("reading the sample: {e}")),
+        };
+        if (sample.width, sample.height) != found.size {
+            return refuse(&format!("{}x{} sample, {}x{} source", sample.width, sample.height, found.size.0, found.size.1));
+        }
+        match copy.check(&sample) {
+            Ok(()) => Some(sample.data),
+            Err(why) => refuse(&format!("sample {}: {why}", sample.index)),
+        }
     }
 
     /// Fit the rendered picture into the output frame.

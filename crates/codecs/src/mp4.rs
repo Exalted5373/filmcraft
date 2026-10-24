@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use filmcraft_color::ColorInfo;
 use filmcraft_frame::{AudioBuffer, Region, VideoFrame};
 use filmcraft_isobmff::{ByteSource, CleanAperture, CodecConfig, Mp4File, TrackKind};
-use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
+use filmcraft_media::{
+    AudioStreamInfo, CompressedSample, FrameRequest, IntraCodec, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo,
+};
 use filmcraft_time::{FrameRate, Tick};
 
 use crate::audio::{PacketDecoder, decode_pcm};
@@ -53,6 +55,10 @@ pub struct Mp4Source {
     file: Mp4File,
     vtrack: Option<usize>,
     video: GopCache,
+    /// The colour the container signals (`colr`), which wins over the frames' own.
+    explicit_color: Option<ColorInfo>,
+    /// Decoded frames are cropped (clean aperture) or rotated (track matrix): not the coded picture.
+    display_transform: bool,
     /// The playable audio tracks in file order: `info.audio_streams[k]` describes `audios[k]`.
     audios: Vec<Mp4Audio>,
 }
@@ -368,7 +374,17 @@ impl Mp4Source {
             .collect();
         snap_to_frame_grid(&mut file, vtrack);
         rebase_unedited_video(&mut file, vtrack, &mut audios);
-        Ok(Self { info, bytes, file, vtrack, video: GopCache::new(explicit_color).with_rotation(rotation).with_crop(aperture), audios })
+        let display_transform = rotation != 0 || aperture.is_some();
+        Ok(Self {
+            info,
+            bytes,
+            file,
+            vtrack,
+            video: GopCache::new(explicit_color).with_rotation(rotation).with_crop(aperture),
+            explicit_color,
+            display_transform,
+            audios,
+        })
     }
 
     fn read(&self, track: usize, i: usize) -> crate::Result<Vec<u8>> {
@@ -471,6 +487,40 @@ impl MediaSource for Mp4Source {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
         let f = self.video_at(req.time.max(Tick::ZERO))?;
         Ok(f)
+    }
+
+    fn compressed_video_sample(&self, time: Tick) -> Result<Option<CompressedSample>, MediaError> {
+        let Some(ti) = self.vtrack.filter(|_| !self.display_transform) else { return Ok(None) };
+        let Some(track) = self.file.tracks.get(ti) else { return Ok(None) };
+        let Some(entry) = track.entries.first() else { return Ok(None) };
+        let codec = match entry.codec {
+            CodecConfig::ProRes { .. } => IntraCodec::ProRes,
+            CodecConfig::Dnx { .. } => IntraCodec::Dnx,
+            _ => return Ok(None),
+        };
+        // the sample `video_frame` decodes: `video_at`'s rounding to the track's timescale, then
+        // `GopCache::frame`'s lookup (the sample presented then, else the last one)
+        let ts = i64::from(track.timescale.max(1));
+        let target = time.max(Tick::ZERO).to_rational_round(1, ts).max(0);
+        let Some(i) = track.sample_at_presentation_time(target).or_else(|| track.samples.len().checked_sub(1)) else { return Ok(None) };
+        let size = track.samples.get(i).map_or(0, |s| u64::from(s.size));
+        if size > filmcraft_media::MAX_COMPRESSED_SAMPLE {
+            return Err(MediaError::Unsupported(format!("video sample {i} is {size} bytes")));
+        }
+        let data = self.read(ti, i)?;
+        let vp = entry.video.as_ref();
+        let width = vp.map(|v| u32::from(v.width)).filter(|&w| w > 0).unwrap_or(track.width);
+        let height = vp.map(|v| u32::from(v.height)).filter(|&h| h > 0).unwrap_or(track.height);
+        Ok(Some(CompressedSample {
+            codec,
+            fourcc: entry.format.0,
+            width,
+            height,
+            container_color: self.explicit_color,
+            par: vp.and_then(|v| v.pixel_aspect).unwrap_or((1, 1)),
+            index: i,
+            data,
+        }))
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {

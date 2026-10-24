@@ -414,6 +414,48 @@ default settings, hardware decoding Auto), the two builds alternating, 4 rounds 
 With NVENC the export is now bound by decoding: the parallel render tasks open 12 NVDEC sessions
 and decode 282 frames for the 192 asked.
 
+## Export: smart rendering of ProRes and DNxHR
+
+An intra-only export of intra-only footage decoded every frame, rendered it, converted it back to
+Y'CbCr and encoded it again, even where the timeline shows the source frame untouched. Now a frame
+that shows one source frame untouched, from a ProRes or DNxHR source in the flavour the export
+encodes, is written as the source's compressed sample, unchanged (nothing is decoded, rendered or
+encoded for it), and every other frame is rendered and encoded as before, in the same track:
+
+- **Where the decision is made.** The render task asks `Pipeline::copied_sample` first: the export
+  draws nothing on the frame (the passthrough conditions above), the timeline shows one source
+  frame untouched (`filmcraft_render::plan::untouched_clip`, the decode-free twin of
+  `untouched_frame`, which gives the media time the renderer would ask for), the clip plays
+  forward at 100 % from a source at the output frame rate, and the source hands out the sample its
+  decoder would decode then (`MediaSource::compressed_video_sample`, MOV / MP4 and MXF). The encoder
+  says what it writes (`VideoEncoder::sample_copy`, ProRes and DNxHR only) and `SampleCopy::check`
+  compares the sample with it, from the container and the frame header: profile fourcc or DNxHR
+  compression ID, coded size, progressive scan, alpha, BT.709 colour (container, and frame header
+  unless it says unspecified), square pixels, frame rate code, and a frame whose sizes and tables
+  agree with the sample (`filmcraft_prores::check_frame`, `filmcraft_dnx::check_frame`). A sample
+  that is missing, unreadable or fails a check is rendered instead; the reason goes to the debug log.
+- **The file.** Copied frames are the source's frames bit for bit (not today's re-encoded ones);
+  the packets are sync samples of one frame with no composition offset, like the encoder's own,
+  and the file is the same on any core count and batch size (`smart_tests`). `perf.stats`
+  `export.smartRender` counts frames copied and frames of such exports rendered instead; the
+  export's status line says how many frames were copied.
+
+8 s of 1080p23.976 ProRes 422 HQ (192 frames, made by exporting the bench's `a1080.mp4` to ProRes
+HQ), imported into a new project (Sequence From Clip) and exported again to ProRes 422 HQ, no audio;
+"title" adds a text clip over the first 4 s. Release `filmcraft-cli`, main's build against this one,
+alternating, 4 rounds each, 24-core Linux machine with other work running (indicative timings);
+wall and CPU (user + sys) time of the whole CLI run:
+
+| project | wall, median (range) before → **after** | CPU, median before → **after** | frames copied |
+|---|---|---|---|
+| plain | 7.02 s (6.27–7.56) → **0.29 s** (0.27–0.34) | 98.7 s → **0.4 s** | 192 of 192 |
+| title over half | 7.58 s (6.48–7.69) → **3.81 s** (3.36–4.45) | 104.5 s → **51.2 s** | 96 of 192 |
+
+`ffprobe -show_packets -show_data_hash` of the plain export lists the source's 192 packets
+(timestamps, durations, sizes, flags and SHA-256 of the data) exactly; in the title export the
+last 96 are the source's and the first 96 are new encodes, and ffmpeg decodes both files without
+an error.
+
 ## Results (HW3: VideoToolbox hardware H.265 (HEVC) encoding, against hardware H.264)
 
 Apple M1 (8 cores, 16 GB), 2026-10-07, single runs on an otherwise idle machine, release build. Both

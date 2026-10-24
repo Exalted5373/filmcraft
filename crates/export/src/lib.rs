@@ -26,6 +26,7 @@ mod pipeline;
 pub mod presets;
 mod raster;
 pub mod settings;
+mod smart;
 pub mod still;
 pub use audio_out::LoudnessReport;
 pub use job::{Exporter, Step, stepped};
@@ -34,6 +35,7 @@ pub use pcm::{image_sequence_path, write_aiff, write_wav};
 pub use pipeline::limit_rgba8;
 pub use presets::{ExportPreset, builtin_presets};
 pub use settings::*;
+pub use smart::{CopyFlavour, SampleCopy, SmartRenderStats, smart_render_stats};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -812,6 +814,11 @@ pub trait VideoEncoder: Send {
         let _ = (picture, index);
         Err(ExportError::Encode("internal: this encoder takes no 4:2:0 pictures".into()))
     }
+    /// The compressed samples this encoder takes as its own packets, unchanged (smart rendering):
+    /// an intra-only encoder whose output flavour a source sample can match. None by default.
+    fn sample_copy(&self) -> Option<SampleCopy> {
+        None
+    }
 }
 
 /// Audio encoder (AAC) plugged in by codec crates; PCM is built in.
@@ -1258,6 +1265,11 @@ impl VideoEncoder for ProResEncoder {
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
+    fn sample_copy(&self) -> Option<SampleCopy> {
+        let alpha = self.alpha && self.profile.chroma() == filmcraft_prores::ChromaFormat::Yuv444;
+        let flavour = CopyFlavour::ProRes { profile: self.profile, alpha };
+        Some(SampleCopy { flavour, width: self.w, height: self.h, rate: self.rate, signal: self.signal })
+    }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let chroma = self.profile.chroma();
         let mut fr = filmcraft_prores::Frame::new(f.width, f.height, chroma, 10, self.alpha);
@@ -1431,6 +1443,11 @@ impl VideoEncoder for DnxEncoder {
     }
     fn timescale(&self) -> u32 {
         self.rate.num as u32
+    }
+    fn sample_copy(&self) -> Option<SampleCopy> {
+        let cfg = self.enc.config();
+        let flavour = CopyFlavour::DnxHr { profile: cfg.profile, bit_depth: cfg.bit_depth };
+        Some(SampleCopy { flavour, width: self.w, height: self.h, rate: self.rate, signal: self.signal })
     }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let mut fr = filmcraft_dnx::Frame::new(f.width, f.height, filmcraft_dnx::ChromaFormat::Yuv422, 10, false);
@@ -2148,3 +2165,6 @@ mod yuv_tests;
 
 #[cfg(test)]
 mod untouched_tests;
+
+#[cfg(test)]
+mod smart_tests;

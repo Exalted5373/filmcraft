@@ -155,6 +155,43 @@ impl FrameRequest {
     }
 }
 
+/// Intra-only codecs whose compressed video samples a source can hand out
+/// ([`MediaSource::compressed_video_sample`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntraCodec {
+    /// Apple ProRes (one frame per sample; the fourcc names the profile).
+    ProRes,
+    /// Avid DNxHD / DNxHR (SMPTE VC-3; the frame header names the compression ID).
+    Dnx,
+}
+
+/// One compressed video sample of an intra-only stream, as stored in the file, with what the
+/// container says about it. Everything in it comes from the file: hostile until checked (the
+/// frame header in `data` especially).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompressedSample {
+    pub codec: IntraCodec,
+    /// The container's sample-description fourcc (`apch`, `ap4h`, `AVdh`…; MXF sources give the
+    /// one their decoder is made with).
+    pub fourcc: [u8; 4],
+    /// Coded picture size the container gives.
+    pub width: u32,
+    pub height: u32,
+    /// The colour the container signals, which overrides the frame header's when the source decodes
+    /// the sample (None: the frame header's colour applies).
+    pub container_color: Option<ColorInfo>,
+    /// Pixel aspect ratio the container signals.
+    pub par: (u32, u32),
+    /// Index of the sample in its track (in stored order).
+    pub index: usize,
+    /// The sample's bytes, unchanged.
+    pub data: Vec<u8>,
+}
+
+/// Largest compressed sample [`MediaSource::compressed_video_sample`] reads (sizes come from the
+/// file); a larger one is not handed out.
+pub const MAX_COMPRESSED_SAMPLE: u64 = 512 << 20;
+
 pub trait MediaSource: Send + Sync {
     fn info(&self) -> &MediaInfo;
     /// The frame displayed at media time `req.time`.
@@ -166,6 +203,15 @@ pub trait MediaSource: Send + Sync {
     /// stream 0 is `audio`, any other index is [`MediaError::NoStream`].
     fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
         if stream == 0 { self.audio(start, frames, sample_rate) } else { Err(MediaError::NoStream("audio")) }
+    }
+    /// The compressed sample whose decoded picture [`video_frame`](Self::video_frame) returns for
+    /// media time `time` (the same time-to-sample mapping), for streams of an intra-only codec
+    /// ([`IntraCodec`]) whose decoded picture is the sample's picture as coded (no clean-aperture
+    /// crop or display rotation applied by the source). `Ok(None)` for every other source, the
+    /// default; an error when the sample can't be read. Used to copy samples unchanged into an
+    /// export of the same codec flavour (smart rendering).
+    fn compressed_video_sample(&self, _time: Tick) -> Result<Option<CompressedSample>> {
+        Ok(None)
     }
 }
 

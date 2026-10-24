@@ -1,0 +1,507 @@
+//! Smart rendering: frames that show a ProRes / DNxHR source untouched are written as the source's
+//! compressed samples, unchanged; everything else is rendered and encoded as before, in the same
+//! track. The sources are made here with FilmCraft's own encoders and MOV writer, and opened
+//! through the normal media path (`filmcraft_codecs::open_bytes`).
+use super::*;
+use filmcraft_color::{ColorPipeline, WorkingSpace};
+use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, TrackConfig, WriteSample, WriterOptions};
+use filmcraft_media::generators::GeneratorSource;
+use filmcraft_media::{FrameRequest, Generator, MediaInfo, MediaSource, SharedSource};
+use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, ParamValue, SequenceSettings, TrackKind};
+use filmcraft_render::SourceMap;
+use filmcraft_time::{Tick, TimeRange};
+
+const W: u32 = 256;
+const H: u32 = 144;
+const RATE: FrameRate = FrameRate::FPS_24;
+const N: usize = 24;
+
+fn tmp(name: &str) -> String {
+    let d = std::env::temp_dir().join(format!("fc-export-smart-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d.join(name).to_string_lossy().to_string()
+}
+
+/// 10-bit planes of picture `n` (it changes from frame to frame).
+fn fill(n: usize, y: &mut [u16], cb: &mut [u16], cr: &mut [u16], w: usize) {
+    for (i, v) in y.iter_mut().enumerate() {
+        *v = (64 + (i % w * 3 + i / w * 2 + n * 17) % 876) as u16;
+    }
+    for (i, v) in cb.iter_mut().enumerate() {
+        *v = (300 + (i * 5 + n * 11) % 400) as u16;
+    }
+    for (i, v) in cr.iter_mut().enumerate() {
+        *v = (350 + (i * 3 + n * 7) % 300) as u16;
+    }
+}
+
+/// `n` ProRes frames of `profile` (alpha coded when `alpha`), the frame headers saying `color`.
+fn prores_samples(profile: filmcraft_prores::Profile, n: usize, alpha: bool, color: filmcraft_prores::ColorInfo) -> Vec<Vec<u8>> {
+    let mut cfg = filmcraft_prores::EncoderConfig::new(profile, W, H);
+    cfg.color = color;
+    cfg.encode_alpha = alpha;
+    let mut enc = filmcraft_prores::Encoder::with_config(cfg);
+    (0..n)
+        .map(|k| {
+            let mut f = filmcraft_prores::Frame::new(W, H, profile.chroma(), 10, alpha);
+            fill(k, &mut f.y, &mut f.cb, &mut f.cr, W as usize);
+            if let Some(a) = f.alpha.as_mut() {
+                a.iter_mut().enumerate().for_each(|(i, v)| *v = (i % 1024) as u16);
+            }
+            enc.encode(&f).unwrap()
+        })
+        .collect()
+}
+
+/// `n` DNxHR frames of `profile`.
+fn dnx_samples(profile: filmcraft_dnx::Profile, n: usize) -> Vec<Vec<u8>> {
+    let mut enc = filmcraft_dnx::Encoder::with_config(filmcraft_dnx::EncoderConfig::new(profile, W, H)).unwrap();
+    (0..n)
+        .map(|k| {
+            let mut f = filmcraft_dnx::Frame::new(W, H, filmcraft_dnx::ChromaFormat::Yuv422, 10, false);
+            fill(k, &mut f.y, &mut f.cb, &mut f.cr, W as usize);
+            enc.encode(&f).unwrap()
+        })
+        .collect()
+}
+
+/// A MOV of `samples` at `rate` described by `entry` (labelled BT.709 unless `entry` says otherwise).
+fn mov(name: &str, mut entry: SampleEntry, rate: FrameRate, samples: &[Vec<u8>]) -> (String, SharedSource) {
+    if entry.video.as_ref().is_some_and(|v| v.color.is_none()) {
+        ColorSignal::default().apply_to(&mut entry, true);
+    }
+    let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+    let track = mux.add_track(TrackConfig::new(entry, rate.num as u32)).unwrap();
+    for s in samples {
+        mux.write_sample(track, WriteSample { data: s, duration: rate.den as u32, composition_offset: 0, is_sync: true }).unwrap();
+    }
+    let bytes = mux.finish().unwrap().into_inner();
+    let path = tmp(name);
+    std::fs::write(&path, &bytes).unwrap();
+    let src = filmcraft_codecs::open_bytes(name, bytes.into()).unwrap();
+    (path, src)
+}
+
+fn prores_entry(profile: filmcraft_prores::Profile) -> SampleEntry {
+    SampleEntry::prores(FourCc(profile.fourcc()), W as u16, H as u16)
+}
+
+fn hq_source(name: &str) -> (String, SharedSource, Vec<Vec<u8>>) {
+    let samples = prores_samples(filmcraft_prores::Profile::Hq, N, false, Default::default());
+    let (path, src) = mov(name, prores_entry(filmcraft_prores::Profile::Hq), RATE, &samples);
+    (path, src, samples)
+}
+
+fn add_item(p: &mut Project, m: &mut SourceMap, name: &str, media: MediaRef, src: SharedSource) -> ItemId {
+    let info: MediaInfo = src.info().clone();
+    let kind = ItemKind::Media(MediaClip {
+        media,
+        info,
+        interpret: Default::default(),
+        mark_in: None,
+        mark_out: None,
+        markers: vec![],
+        offline: false,
+        proxy: None,
+        identity: None,
+    });
+    let id = p.add_item(name, Label::Iris, kind, None);
+    m.0.insert(id, src);
+    id
+}
+
+/// A `W` x `H` sequence at `rate` (two video tracks) showing the whole source on V1, then `edit`.
+fn project(
+    path: &str,
+    src: SharedSource,
+    settings: SequenceSettings,
+    edit: impl FnOnce(&mut Project, ItemId, ItemId, &mut SourceMap),
+) -> (Arc<Project>, ItemId, SourceMap) {
+    let mut p = Project::new("smart");
+    let mut m = SourceMap::default();
+    let item = add_item(&mut p, &mut m, "source", MediaRef::File { path: path.into() }, src);
+    let rate = settings.frame_rate;
+    let seq = p.new_sequence("s", settings, 2, 1, None);
+    let clip = p.make_track_item(item, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, rate.tick_of(N as i64)), rate).unwrap();
+    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
+    edit(&mut p, seq, item, &mut m);
+    (Arc::new(p), seq, m)
+}
+
+fn seq_settings() -> SequenceSettings {
+    SequenceSettings { width: W, height: H, frame_rate: RATE, ..Default::default() }
+}
+
+fn prores(name: &str, profile: &str) -> ExportSettings {
+    ExportSettings { format: Format::ProRes, path: tmp(name), include_audio: false, prores_profile: profile.into(), ..Default::default() }
+}
+
+fn dnxhr(name: &str, profile: &str) -> ExportSettings {
+    ExportSettings { format: Format::DnxHr, path: tmp(name), include_audio: false, dnx_profile: profile.into(), ..Default::default() }
+}
+
+/// Export on a pool of `threads`, `batch` frames per step; the file and the frames copied.
+fn export_with(p: Arc<Project>, seq: ItemId, m: &SourceMap, s: &ExportSettings, threads: usize, batch: i64, overlap: bool, copies: bool) -> (Vec<u8>, u64) {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let copied = pool.install(|| {
+        let prog = Progress::default();
+        let mut ex = Exporter::new(p, seq, s, &prog).unwrap();
+        ex.set_batch(batch);
+        ex.set_overlap(overlap);
+        ex.set_copies(copies);
+        while !matches!(ex.step(m, &prog).unwrap(), Step::Done(_)) {}
+        ex.copied_frames()
+    });
+    (std::fs::read(&s.path).unwrap(), copied)
+}
+
+fn export(p: Arc<Project>, seq: ItemId, m: &SourceMap, s: &ExportSettings) -> (Vec<u8>, u64) {
+    export_with(p, seq, m, s, 4, 6, true, true)
+}
+
+/// The video samples of a MOV with their (dts, pts, duration, sync) and the track's timescale
+/// and sample description fourcc.
+fn video_samples(bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<(i64, i64, u32, bool)>, u32, [u8; 4]) {
+    let f = filmcraft_isobmff::open(bytes).unwrap();
+    let t = f.tracks.iter().position(|t| t.kind == filmcraft_isobmff::TrackKind::Video).unwrap();
+    let track = &f.tracks[t];
+    let data = (0..track.samples.len()).map(|i| f.read_sample(bytes, t, i).unwrap()).collect();
+    let timing = track.samples.iter().map(|s| (s.dts, s.pts, s.duration, s.is_sync)).collect();
+    (data, timing, track.timescale, track.entries[0].format.0)
+}
+
+/// Decoded planes of frame `k` of `src` (16-bit Y'CbCr).
+fn decoded(src: &dyn MediaSource, k: usize) -> Vec<Vec<u16>> {
+    planes(&src.video_frame(FrameRequest::full(RATE.tick_of(k as i64))).unwrap())
+}
+
+fn planes(f: &filmcraft_frame::VideoFrame) -> Vec<Vec<u16>> {
+    match &f.data {
+        filmcraft_frame::PixelData::Yuv16 { planes, .. } => planes.iter().map(|p| p.to_vec()).collect(),
+        filmcraft_frame::PixelData::Yuv8 { planes, .. } => planes.iter().map(|p| p.iter().map(|&v| u16::from(v)).collect()).collect(),
+        other => panic!("not Y'CbCr: {:?}", std::mem::discriminant(other)),
+    }
+}
+
+#[test]
+fn an_untouched_prores_hq_clip_is_copied_sample_for_sample() {
+    let (path, src, samples) = hq_source("hq.mov");
+    let (p, seq, m) = project(&path, src, seq_settings(), |_, _, _, _| {});
+    let before = smart_render_stats();
+    let (bytes, copied) = export(p, seq, &m, &prores("hq-out.mov", "hq"));
+    assert_eq!(copied, N as u64);
+    assert!(smart_render_stats().copied >= before.copied + N as u64, "counted for perf.stats");
+    let (out, timing, timescale, fourcc) = video_samples(&bytes);
+    assert_eq!(&fourcc, b"apch");
+    assert_eq!(timescale, 24);
+    assert_eq!(out.len(), N, "frame count");
+    for (k, (o, s)) in out.iter().zip(&samples).enumerate() {
+        assert!(o == s, "sample {k} differs from the source's");
+        assert_eq!(timing[k], (k as i64, k as i64, 1, true), "timing of sample {k}");
+    }
+}
+
+fn set(p: &mut Project, seq: ItemId, clip: usize, effect: &str, param: &str, value: f64) {
+    let c = &mut p.sequence_mut(seq).unwrap().video_tracks[0].items[clip];
+    c.effect_mut(effect).unwrap().param_mut(param).unwrap().value = ParamValue::Float(value);
+}
+
+/// V1: the source in three clips, 0..8 as it is, 8..16 at half opacity, 16..24 blurred; V2: a red
+/// matte over frames 4..6. Frames 0..4 and 6..8 are untouched.
+fn mixed_edit(p: &mut Project, seq: ItemId, item: ItemId, m: &mut SourceMap) {
+    let clips: Vec<_> = (0..3)
+        .map(|k| p.make_track_item(item, TrackKind::Video, RATE.tick_of(8 * k), TimeRange::new(RATE.tick_of(8 * k), RATE.tick_of(8)), RATE).unwrap())
+        .collect();
+    p.sequence_mut(seq).unwrap().video_tracks[0].items = clips;
+    set(p, seq, 1, "opacity", "opacity", 50.0);
+    let blur = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+    p.sequence_mut(seq).unwrap().video_tracks[0].items[2].effects.push(blur);
+    let matte = GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, W, H, RATE, RATE.tick_of(48));
+    let g = matte.generator.clone();
+    let top = add_item(p, m, "matte", MediaRef::Generator(g), Arc::new(matte));
+    let clip = p.make_track_item(top, TrackKind::Video, RATE.tick_of(4), TimeRange::new(Tick::ZERO, RATE.tick_of(2)), RATE).unwrap();
+    p.sequence_mut(seq).unwrap().video_tracks[1].items.push(clip);
+}
+
+const UNTOUCHED: [usize; 6] = [0, 1, 2, 3, 6, 7];
+
+#[test]
+fn only_the_frames_nothing_is_drawn_on_are_copied() {
+    let (path, src, samples) = hq_source("mixed.mov");
+    let (p, seq, m) = project(&path, src.clone(), seq_settings(), mixed_edit);
+    let (bytes, copied) = export(p.clone(), seq, &m, &prores("mixed-out.mov", "hq"));
+    let (reference, none) = export_with(p, seq, &m, &prores("mixed-ref.mov", "hq"), 4, 6, true, false);
+    assert_eq!((copied, none), (UNTOUCHED.len() as u64, 0));
+    let (out, timing, _, _) = video_samples(&bytes);
+    let (rendered, _, _, _) = video_samples(&reference);
+    assert_eq!(out.len(), N);
+    for k in 0..N {
+        assert_eq!(timing[k], (k as i64, k as i64, 1, true), "timing of sample {k}");
+        if UNTOUCHED.contains(&k) {
+            assert!(out[k] == samples[k], "frame {k}: not the source's sample");
+        } else {
+            // ProRes encodes every frame on its own: the rendered frames are the same as without copies
+            assert!(out[k] == rendered[k], "frame {k}: not rendered and encoded as before");
+        }
+    }
+    // our decoder: copied frames are the source's pictures; the matte frames are red
+    let file = filmcraft_codecs::open_bytes("mixed-out.mov", bytes.into()).unwrap();
+    for k in UNTOUCHED {
+        assert!(decoded(&*file, k) == decoded(&*src, k), "frame {k} decodes differently from the source");
+    }
+    for k in [4, 5] {
+        let cr = &decoded(&*file, k)[2];
+        assert!(cr.iter().all(|&v| v > 800), "frame {k}: not the red matte");
+    }
+    let first_opacity_frame = &decoded(&*file, 8)[0];
+    assert!(first_opacity_frame != &decoded(&*src, 8)[0], "frame 8 is at half opacity");
+}
+
+#[test]
+fn the_file_is_the_same_on_any_core_count_and_batch() {
+    let (path, src, _) = hq_source("det.mov");
+    let (p, seq, m) = project(&path, src, seq_settings(), mixed_edit);
+    let (reference, copied) = export_with(p.clone(), seq, &m, &prores("det-ref.mov", "hq"), 1, 1, false, true);
+    assert_eq!(copied, UNTOUCHED.len() as u64);
+    for (threads, batch, overlap) in [(2, 3, true), (5, 7, true), (16, 24, false), (3, 1, true)] {
+        let (other, n) = export_with(p.clone(), seq, &m, &prores(&format!("det-{threads}-{batch}.mov"), "hq"), threads, batch, overlap, true);
+        assert_eq!(n, copied);
+        assert!(reference == other, "{threads} threads, {batch} per step: a different file");
+    }
+}
+
+/// Export `settings` of a project and say how many frames were copied.
+fn copies(
+    path: &str,
+    src: SharedSource,
+    seq: SequenceSettings,
+    edit: impl FnOnce(&mut Project, ItemId, ItemId, &mut SourceMap),
+    settings: &ExportSettings,
+) -> u64 {
+    let (p, seq, m) = project(path, src, seq, edit);
+    export(p, seq, &m, settings).1
+}
+
+#[test]
+fn a_different_flavour_size_rate_or_timing_is_rendered() {
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    let (path, src, _) = hq_source("cases.mov");
+    // the same source copies into HQ...
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &prores("c-hq.mov", "hq")), N as u64);
+    // ...but not into another profile
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &prores("c-lt.mov", "lt")), 0, "HQ source, LT export");
+    let lt = prores_samples(filmcraft_prores::Profile::Lt, N, false, Default::default());
+    let (lt_path, lt_src) = mov("lt.mov", prores_entry(filmcraft_prores::Profile::Lt), RATE, &lt);
+    assert_eq!(copies(&lt_path, lt_src.clone(), seq_settings(), none, &prores("c-lt-hq.mov", "hq")), 0, "LT source, HQ export");
+    assert_eq!(copies(&lt_path, lt_src, seq_settings(), none, &prores("c-lt-lt.mov", "lt")), N as u64, "LT source, LT export");
+    // another output size
+    let half = ExportSettings { frame_size: Some((W / 2, H / 2)), ..prores("c-size.mov", "hq") };
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &half), 0, "another frame size");
+    // a sequence at another rate than the source (frames sampled, not copied)
+    let at25 = SequenceSettings { frame_rate: FrameRate::FPS_25, ..seq_settings() };
+    assert_eq!(copies(&path, src.clone(), at25, none, &prores("c-25.mov", "hq")), 0, "24 fps source, 25 fps export");
+    let out25 = ExportSettings { frame_rate: Some(FrameRate::FPS_25), ..prores("c-out25.mov", "hq") };
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &out25), 0, "24 fps source, 25 fps output rate");
+    // a speed change (Frame Sampling: the renderer shows source frames as they are)
+    let speed = |p: &mut Project, seq: ItemId, _: ItemId, _: &mut SourceMap| p.sequence_mut(seq).unwrap().video_tracks[0].items[0].speed = 2.0;
+    assert_eq!(copies(&path, src.clone(), seq_settings(), speed, &prores("c-speed.mov", "hq")), 0, "speed 200 %");
+    let reverse = |p: &mut Project, seq: ItemId, _: ItemId, _: &mut SourceMap| p.sequence_mut(seq).unwrap().video_tracks[0].items[0].reverse = true;
+    assert_eq!(copies(&path, src.clone(), seq_settings(), reverse, &prores("c-rev.mov", "hq")), 0, "reversed");
+    // the export draws on the frame
+    let mut tc = prores("c-tc.mov", "hq");
+    tc.effects.timecode_overlay.enabled = true;
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &tc), 0, "timecode overlay");
+    let mut lim = prores("c-lim.mov", "hq");
+    lim.effects.video_limiter.enabled = true;
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &lim), 0, "video limiter");
+    // HDR output
+    let hdr = SequenceSettings { color: ColorPipeline { working: WorkingSpace::Rec2100Hlg, ..Default::default() }, ..seq_settings() };
+    assert_eq!(copies(&path, src, hdr, none, &prores("c-hdr.mov", "hq")), 0, "HDR export");
+}
+
+#[test]
+fn alpha_and_colour_must_match_the_export() {
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    use filmcraft_prores::{ColorInfo as Codes, Profile};
+    // 4444 with alpha into 4444 without (the alpha would be dropped, not copied)
+    let alpha = prores_samples(Profile::P4444, N, true, Default::default());
+    let (path, src) = mov("alpha.mov", prores_entry(Profile::P4444), RATE, &alpha);
+    assert!(src.info().video.as_ref().unwrap().has_alpha);
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &prores("a-flat.mov", "4444")), 0, "alpha dropped");
+    let keep = ExportSettings { alpha: true, ..prores("a-keep.mov", "4444") };
+    assert_eq!(copies(&path, src, seq_settings(), none, &keep), 0, "alpha kept: the export composites over nothing, still not copied");
+    // 4444 without alpha copies into 4444
+    let opaque = prores_samples(Profile::P4444, N, false, Default::default());
+    let (path, src) = mov("opaque.mov", prores_entry(Profile::P4444), RATE, &opaque);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("a-opaque.mov", "4444")), N as u64);
+    // another colour in the container...
+    let mut e = prores_entry(Profile::Hq);
+    e.video.as_mut().unwrap().color = Some(filmcraft_isobmff::ColorInfo::Nclc { primaries: 9, transfer: 1, matrix: 9 });
+    let samples = prores_samples(Profile::Hq, N, false, Default::default());
+    let (path, src) = mov("c2020.mov", e, RATE, &samples);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("c-2020.mov", "hq")), 0, "BT.2020 container colour");
+    // ...or in the frame headers
+    let samples = prores_samples(Profile::Hq, N, false, Codes { primaries: 1, transfer: 1, matrix: 6 });
+    let (path, src) = mov("c601.mov", prores_entry(Profile::Hq), RATE, &samples);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("c-601.mov", "hq")), 0, "BT.601 frame headers");
+    // unspecified colour in the frame headers: the container's BT.709 applies
+    let samples = prores_samples(Profile::Hq, N, false, Codes { primaries: 2, transfer: 2, matrix: 2 });
+    let (path, src) = mov("c-unspec.mov", prores_entry(Profile::Hq), RATE, &samples);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("c-unspec-out.mov", "hq")), N as u64, "unspecified frame colour");
+}
+
+#[test]
+fn dnxhr_copies_into_the_same_profile_only() {
+    use filmcraft_dnx::Profile;
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    let entry = || SampleEntry::dnx(FourCc(*b"AVdh"), W as u16, H as u16);
+    let hq = dnx_samples(Profile::Hq, N);
+    let (path, src) = mov("dnx-hq.mov", entry(), RATE, &hq);
+    let (p, seq, m) = project(&path, src.clone(), seq_settings(), none);
+    let (bytes, copied) = export(p, seq, &m, &dnxhr("dnx-hq-out.mov", "hq"));
+    assert_eq!(copied, N as u64);
+    let (out, timing, _, fourcc) = video_samples(&bytes);
+    assert_eq!(&fourcc, b"AVdh");
+    for k in 0..N {
+        assert!(out[k] == hq[k], "sample {k}");
+        assert_eq!(timing[k], (k as i64, k as i64, 1, true));
+    }
+    let lb = dnx_samples(Profile::Lb, N);
+    let (path, src) = mov("dnx-lb.mov", entry(), RATE, &lb);
+    assert_eq!(copies(&path, src.clone(), seq_settings(), none, &dnxhr("dnx-lb-hq.mov", "hq")), 0, "LB source, HQ export");
+    assert_eq!(copies(&path, src, seq_settings(), none, &dnxhr("dnx-lb-lb.mov", "lb")), N as u64, "LB source, LB export");
+}
+
+#[test]
+fn damaged_or_lying_samples_are_rendered_and_the_export_succeeds() {
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    let mut samples = prores_samples(filmcraft_prores::Profile::Hq, N, false, Default::default());
+    // 3: truncated; 5: a frame header that says another width; 7: a frame size past the sample;
+    // 9: one byte appended (the frame header's size no longer matches the sample's)
+    let cut = samples[3].len() - 100;
+    samples[3].truncate(cut);
+    samples[5][16..18].copy_from_slice(&((W - 16) as u16).to_be_bytes());
+    let len = samples[7].len() as u32 + 64;
+    samples[7][0..4].copy_from_slice(&len.to_be_bytes());
+    samples[9].push(0);
+    let (path, src) = mov("lies.mov", prores_entry(filmcraft_prores::Profile::Hq), RATE, &samples);
+    let (p, seq, m) = project(&path, src, seq_settings(), none);
+    let (bytes, copied) = export(p, seq, &m, &prores("lies-out.mov", "hq"));
+    assert_eq!(copied, N as u64 - 4);
+    let (out, _, _, _) = video_samples(&bytes);
+    assert_eq!(out.len(), N);
+    for k in [3, 5, 7, 9] {
+        assert!(out[k] != samples[k], "damaged sample {k} was copied");
+        filmcraft_prores::check_frame(&out[k]).expect("re-encoded frame");
+    }
+    // DNxHR: a compression ID that is not the export's, and a sample cut short
+    use filmcraft_dnx::Profile;
+    let mut dnx = dnx_samples(Profile::Hq, N);
+    dnx[2][0x28..0x2C].copy_from_slice(&Profile::Lb.cid().to_be_bytes());
+    let cut = dnx[4].len() / 2;
+    dnx[4].truncate(cut);
+    let (path, src) = mov("dnx-lies.mov", SampleEntry::dnx(FourCc(*b"AVdh"), W as u16, H as u16), RATE, &dnx);
+    let (p, seq, m) = project(&path, src, seq_settings(), none);
+    let (bytes, copied) = export(p, seq, &m, &dnxhr("dnx-lies-out.mov", "hq"));
+    assert_eq!(copied, N as u64 - 2);
+    let (out, _, _, _) = video_samples(&bytes);
+    assert!(out[2] != dnx[2] && out[4] != dnx[4]);
+}
+
+#[test]
+fn the_sample_check_survives_hostile_bytes() {
+    let copy = SampleCopy {
+        flavour: CopyFlavour::ProRes { profile: filmcraft_prores::Profile::Hq, alpha: false },
+        width: W,
+        height: H,
+        rate: RATE,
+        signal: ColorSignal::default(),
+    };
+    let dnx_copy = SampleCopy { flavour: CopyFlavour::DnxHr { profile: filmcraft_dnx::Profile::Hq, bit_depth: 8 }, ..copy };
+    let sample = |codec, fourcc: &[u8; 4], data: Vec<u8>| filmcraft_media::CompressedSample {
+        codec,
+        fourcc: *fourcc,
+        width: W,
+        height: H,
+        container_color: None,
+        par: (1, 1),
+        index: 0,
+        data,
+    };
+    let prores = prores_samples(filmcraft_prores::Profile::Hq, 1, false, Default::default()).remove(0);
+    let dnx = dnx_samples(filmcraft_dnx::Profile::Hq, 1).remove(0);
+    assert!(copy.check(&sample(filmcraft_media::IntraCodec::ProRes, b"apch", prores.clone())).is_ok());
+    assert!(dnx_copy.check(&sample(filmcraft_media::IntraCodec::Dnx, b"AVdh", dnx.clone())).is_ok());
+    let mut rng = 0x1234_5678_u32;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng as usize
+    };
+    for (c, codec, fourcc, good) in [(copy, filmcraft_media::IntraCodec::ProRes, b"apch", prores), (dnx_copy, filmcraft_media::IntraCodec::Dnx, b"AVdh", dnx)] {
+        for len in [0, 1, 7, 8, 27, 28, 100, 0x27F, 0x280, 0x2000, good.len() - 1] {
+            let data = good.get(..len.min(good.len())).unwrap().to_vec();
+            let r = std::panic::catch_unwind(|| c.check(&sample(codec, fourcc, data)));
+            assert!(r.is_ok_and(|r| r.is_err()), "truncated to {len}");
+        }
+        for _ in 0..2000 {
+            let mut data = good.clone();
+            for _ in 0..1 + next() % 4 {
+                let i = next() % 0x300.min(data.len());
+                data[i] ^= 1 << (next() % 8);
+            }
+            let r = std::panic::catch_unwind(|| c.check(&sample(codec, fourcc, data)));
+            assert!(r.is_ok(), "the check panicked on flipped bits");
+        }
+    }
+}
+
+#[test]
+fn untouched_clip_names_the_frame_untouched_frame_returns() {
+    use filmcraft_render::RenderOptions;
+    type Edit = fn(&mut Project, ItemId, ItemId, &mut SourceMap);
+    let cases: [(&str, Edit); 5] = [
+        ("plain", |_, _, _, _| {}),
+        ("mixed", mixed_edit),
+        ("scaled", |p, s, _, _| set(p, s, 0, "motion", "scale", 50.0)),
+        ("speed 2 sampled", |p, s, _, _| p.sequence_mut(s).unwrap().video_tracks[0].items[0].speed = 2.0),
+        ("speed 1.5 blended", |p, s, _, _| {
+            let c = &mut p.sequence_mut(s).unwrap().video_tracks[0].items[0];
+            c.speed = 1.5;
+            c.time_interpolation = filmcraft_project::TimeInterpolation::FrameBlending;
+        }),
+    ];
+    let (path, src, _) = hq_source("agree.mov");
+    for (name, edit) in cases {
+        let (p, seq, m) = project(&path, src.clone(), seq_settings(), edit);
+        let opts = RenderOptions::default();
+        for k in 0..N as i64 {
+            let t = RATE.tick_of(k);
+            let frame = filmcraft_render::plan::untouched_frame(&p, seq, t, opts, &m);
+            let clip = filmcraft_render::plan::untouched_clip(&p, seq, t, opts, &m);
+            assert_eq!(frame.is_some(), clip.is_some(), "{name}: frame {k}");
+            if let (Some(frame), Some(clip)) = (frame, clip) {
+                let named = src.video_frame(FrameRequest::full(clip.time)).unwrap();
+                assert!(Arc::ptr_eq(&frame, &named) || planes(&frame) == planes(&named), "{name}: frame {k} is not the one named");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_mxf_source_copies_too() {
+    // the HQ source exported to MXF without copies (re-encoded), then that MXF exported to MOV
+    let (path, src, _) = hq_source("for-mxf.mov");
+    let (p, seq, m) = project(&path, src, seq_settings(), |_, _, _, _| {});
+    let mxf = ExportSettings { format: Format::MxfOp1a, mxf_video_codec: MxfVideoCodec::ProRes, ..prores("src.mxf", "hq") };
+    let (mxf_bytes, _) = export_with(p, seq, &m, &mxf, 2, 4, true, false);
+    let mxf_src = filmcraft_codecs::open_bytes("src.mxf", mxf_bytes.into()).unwrap();
+    let wanted: Vec<Vec<u8>> = (0..N).map(|k| mxf_src.compressed_video_sample(RATE.tick_of(k as i64)).unwrap().unwrap().data).collect();
+    let mxf_path = mxf.path.clone();
+    let (p, seq, m) = project(&mxf_path, mxf_src, seq_settings(), |_, _, _, _| {});
+    let (bytes, copied) = export(p, seq, &m, &prores("from-mxf.mov", "hq"));
+    assert_eq!(copied, N as u64);
+    let (out, _, _, _) = video_samples(&bytes);
+    assert!(out == wanted, "the MXF's samples");
+}
