@@ -385,6 +385,35 @@ for the cores on the render side; on a machine with idle cores more of it is sav
 average of 30-40 from other work the wall-time difference was inside the noise, and CPU time fell by
 2-5 %.
 
+## Export: frames nothing is drawn on go to the encoder as decoded
+
+A frame that is one clip at the sequence's size, with no effect, mask, transition, caption or
+other layer over it, Motion at rest and full opacity, was still rendered: its decoded 8-bit 4:2:0
+converted to linear float RGBA (`convert_region`), flattened over black, turned into RGBA8, and
+converted back to 4:2:0 by the encoder (the built-in one on the CPU, NVENC on the GPU). Now:
+
+- **`filmcraft_render::plan::untouched_frame`** finds such a frame (the timeline is checked before
+  anything is planned, so composited frames are not planned twice) and the exporter hands its
+  decoded planes straight to an encoder that takes 4:2:0 (`VideoEncoder::takes_yuv420`): the
+  built-in H.264 encoder and NVENC (through an NV12 buffer next to each RGBA one; the input format
+  is set per picture). Only BT.709 limited-range 8-bit 4:2:0 without alpha qualifies, in an SDR
+  export with nothing drawn on the output (no alpha, limiter, overlays or scaling).
+- **The picture is the source's own.** The round trip through RGB clipped colours outside the RGB
+  cube and moved the others by a code or two. Frame 0 of the export below against the source,
+  RMS difference of the 8-bit planes (encoding included): Y 3.44 → 1.23, Cb 4.69 → 1.04,
+  Cr 7.65 → 1.04 (the bench clip has strongly saturated colours).
+
+Same machine and method as above (release CLI, `a1080.mp4`, 192 frames of 1080p23.976 with AAC,
+default settings, hardware decoding Auto), the two builds alternating, 4 rounds each:
+
+| encoder | export, median (range) before → **after** | CPU time, median before → **after** |
+|---|---|---|
+| built-in H.264 | 5.06 s (4.88–5.26) → **4.57 s** (4.44–4.70) | 64.6 s → **52.1 s** |
+| NVENC (Hardware encoding Auto) | 1.68 s (1.67–1.73) → **1.34 s** (1.29–1.43) | 16.2 s → **5.5 s** |
+
+With NVENC the export is now bound by decoding: the parallel render tasks open 12 NVDEC sessions
+and decode 282 frames for the 192 asked.
+
 ## Results (HW3: VideoToolbox hardware H.265 (HEVC) encoding, against hardware H.264)
 
 Apple M1 (8 cores, 16 GB), 2026-10-07, single runs on an otherwise idle machine, release build. Both

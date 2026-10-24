@@ -60,6 +60,12 @@
 //!   by the render task that drew them, with the same function it would run, so the conversion is
 //!   off the serial encode side and a frame in flight holds 1.5 bytes per pixel instead of 4 (12
 //!   for HDR). The file is the same either way (`determinism_tests`).
+//! * **Untouched frames.** A frame the renderer would only turn into linear light and back (one
+//!   decoded 8-bit 4:2:0 BT.709 clip at the output size with nothing drawn on it:
+//!   [`filmcraft_render::plan::untouched_frame`], `Pipeline::untouched_yuv420`) goes to an encoder
+//!   that [`VideoEncoder::takes_yuv420`] as it was decoded, without being rendered. It skips the
+//!   round trip through RGB, which clipped colours outside the RGB cube and moved the others by a
+//!   code or two (`untouched_tests`).
 //! * **Timers.** `Render` and `Encode` are wall times of work that now runs at the same time, so
 //!   their sum may exceed the export's wall time; `Wait` is the time the encoding side then spent
 //!   waiting for the render (large: render-bound; near zero: encode-bound).
@@ -93,8 +99,9 @@ pub const INTERLEAVE: i64 = 16;
 pub const IN_FLIGHT_BUDGET: u64 = 1 << 29;
 
 /// One rendered picture: straight RGBA8, or for HDR exports the encoded R'G'B' floats. For an
-/// encoder that converts its pictures to 4:2:0 ([`VideoEncoder::yuv420_input`]), those planes
-/// instead: converted while rendering, so the encoder does not wait for the conversion.
+/// encoder that takes 4:2:0 ([`VideoEncoder::takes_yuv420`]), those planes instead: an untouched
+/// frame as it was decoded, or the picture converted while rendering, so the encoder does not wait
+/// for the conversion.
 enum Frame {
     Picture(Vec<u8>, Vec<f32>),
     Yuv420(Yuv420),
@@ -121,26 +128,47 @@ struct Ahead {
     frames: Vec<Frame>,
 }
 
-/// Render frames `f..end` in parallel, converting them with `yuv` when the encoder takes 4:2:0.
-/// `None` when a source was not ready for one of them (the pending flag, taken after every frame
-/// because it is per thread): the batch is incomplete and must be rendered again.
-fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider, yuv: Option<Yuv420Input>) -> Option<Vec<Frame>> {
+/// What the encoder takes besides RGBA pictures.
+#[derive(Clone, Copy)]
+struct EncoderInput {
+    /// Untouched frames as they were decoded ([`VideoEncoder::takes_yuv420`]).
+    untouched: bool,
+    /// The conversion to 4:2:0 to run while rendering ([`VideoEncoder::yuv420_input`]).
+    convert: Option<Yuv420Input>,
+}
+
+impl EncoderInput {
+    fn of(venc: &dyn VideoEncoder) -> Self {
+        EncoderInput { untouched: venc.takes_yuv420(), convert: venc.yuv420_input() }
+    }
+}
+
+/// Render frames `f..end` in parallel, as the encoder takes them (`input`). `None` when a source
+/// was not ready for one of them (the pending flag, taken after every frame because it is per
+/// thread): the batch is incomplete and must be rendered again.
+fn render_batch(pipe: &Pipeline, f: i64, end: i64, sources: &dyn SourceProvider, input: EncoderInput) -> Option<Vec<Frame>> {
     let pending = AtomicBool::new(false);
     let frames: Vec<Frame> = (f..end)
         .into_par_iter()
         .map(|fi| {
-            let (rgba, hdr) = pipe.frame(fi, sources);
+            let untouched = if input.untouched { pipe.untouched_yuv420(fi, sources) } else { None };
+            let frame = match (untouched, input.convert) {
+                (Some(picture), _) => Frame::Yuv420(picture),
+                (None, Some(convert)) => {
+                    let (rgba, hdr) = pipe.frame(fi, sources);
+                    let mut picture = Yuv420::default();
+                    convert.convert(&rgba, pipe.hdr_out.then_some(hdr.as_slice()), pipe.w, pipe.h, &mut picture);
+                    Frame::Yuv420(picture)
+                }
+                (None, None) => {
+                    let (rgba, hdr) = pipe.frame(fi, sources);
+                    Frame::Picture(rgba, hdr)
+                }
+            };
             if filmcraft_media::pending::take() {
                 pending.store(true, Ordering::Relaxed);
             }
-            match yuv {
-                Some(input) => {
-                    let mut picture = Yuv420::default();
-                    input.convert(&rgba, pipe.hdr_out.then_some(hdr.as_slice()), pipe.w, pipe.h, &mut picture);
-                    Frame::Yuv420(picture)
-                }
-                None => Frame::Picture(rgba, hdr),
-            }
+            frame
         })
         .collect();
     (!pending.load(Ordering::Relaxed)).then_some(frames)
@@ -183,8 +211,9 @@ pub struct Exporter {
     overlapped_steps: u64,
     brand: Brand,
     venc: Box<dyn VideoEncoder>,
-    /// The encoder's conversion to 4:2:0 ([`VideoEncoder::yuv420_input`]), run while rendering.
-    yuv: Option<Yuv420Input>,
+    /// What the encoder takes besides RGBA pictures (untouched frames, the conversion to run while
+    /// rendering).
+    input: EncoderInput,
     aenc: Option<Box<dyn AudioEncoder>>,
     audio: Option<AudioOut>,
     /// The loudness pass ran (or is not needed).
@@ -297,7 +326,7 @@ impl Exporter {
             ahead: None,
             overlapped_steps: 0,
             brand,
-            yuv: venc.yuv420_input(),
+            input: EncoderInput::of(venc.as_ref()),
             venc,
             aenc,
             audio,
@@ -345,7 +374,15 @@ impl Exporter {
     /// (tests check that the file is the same).
     #[cfg(test)]
     pub(crate) fn set_convert_ahead(&mut self, on: bool) {
-        self.yuv = if on { self.venc.yuv420_input() } else { None };
+        self.input.convert = if on { self.venc.yuv420_input() } else { None };
+        self.ahead = None;
+    }
+
+    /// Hand untouched frames to the encoder as they were decoded, or render them like the others
+    /// (tests compare the two).
+    #[cfg(test)]
+    pub(crate) fn set_untouched(&mut self, on: bool) {
+        self.input.untouched = on && self.venc.takes_yuv420();
         self.ahead = None;
     }
 
@@ -502,7 +539,8 @@ impl Exporter {
             let stats = self.venc.pass_stats().ok_or_else(|| ExportError::Encode("two-pass statistics missing".into()))?;
             self.settings.h264_pass = H264Pass::Second(stats);
             self.venc = make_venc(&self.settings, self.pipe.w, self.pipe.h, self.pipe.rate)?;
-            self.yuv = self.yuv.and(self.venc.yuv420_input());
+            let fresh = EncoderInput::of(self.venc.as_ref());
+            self.input = EncoderInput { untouched: self.input.untouched && fresh.untouched, convert: self.input.convert.and(fresh.convert) };
             self.first_pass = false;
             self.next = self.f0;
             return Ok(Step::Progress);
@@ -563,8 +601,8 @@ impl Exporter {
             Some(a) if a.first == self.next => (a.first, a.frames),
             _ => {
                 let (f, end) = (self.next, self.next.saturating_add(self.batch_len()).min(self.f1));
-                let (pipe, yuv) = (&self.pipe, self.yuv);
-                match timed(Stage::Render, || render_batch(pipe, f, end, sources, yuv)) {
+                let (pipe, input) = (&self.pipe, self.input);
+                match timed(Stage::Render, || render_batch(pipe, f, end, sources, input)) {
                     Some(frames) => (f, frames),
                     None => return Ok(Step::Pending),
                 }
@@ -587,12 +625,12 @@ impl Exporter {
                 }
             };
         };
-        let (pipe, yuv) = (self.pipe.clone(), self.yuv);
+        let (pipe, input) = (self.pipe.clone(), self.input);
         let mut slot: Option<std::thread::Result<Option<Vec<Frame>>>> = None;
         let mut encode_done: Option<web_time::Instant> = None;
         let encoded = rayon::in_place_scope(|s| {
             s.spawn(|_| {
-                slot = Some(catch_unwind(AssertUnwindSafe(|| timed(Stage::Render, || render_batch(&pipe, a, b, sources, yuv)))));
+                slot = Some(catch_unwind(AssertUnwindSafe(|| timed(Stage::Render, || render_batch(&pipe, a, b, sources, input)))));
             });
             let r = self.encode_batch(f, frames, sources);
             encode_done = Some(web_time::Instant::now());

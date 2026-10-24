@@ -798,8 +798,16 @@ pub trait VideoEncoder: Send {
     fn yuv420_input(&self) -> Option<Yuv420Input> {
         None
     }
-    /// Encode picture `index` (as [`EncoderFrame::index`]), already converted with this encoder's
-    /// [`VideoEncoder::yuv420_input`]. Only called on encoders that have one.
+    /// Whether [`VideoEncoder::encode_yuv420`] takes pictures. The exporter then also hands it the
+    /// frames that need no rendering ([`filmcraft_render::plan::untouched_frame`]) as they were
+    /// decoded, in 8-bit 4:2:0 BT.709 limited range. By default, the encoders that have a
+    /// [`VideoEncoder::yuv420_input`].
+    fn takes_yuv420(&self) -> bool {
+        self.yuv420_input().is_some()
+    }
+    /// Encode picture `index` (as [`EncoderFrame::index`]) from 8-bit 4:2:0 planes: converted with
+    /// this encoder's [`VideoEncoder::yuv420_input`], or decoded so (an untouched frame). Only
+    /// called on encoders that [`VideoEncoder::takes_yuv420`].
     fn encode_yuv420(&mut self, picture: &Yuv420, index: u64) -> Result<Vec<EncodedPacket>> {
         let _ = (picture, index);
         Err(ExportError::Encode("internal: this encoder takes no 4:2:0 pictures".into()))
@@ -2137,3 +2145,6 @@ mod hdr_tests;
 
 #[cfg(test)]
 mod yuv_tests;
+
+#[cfg(test)]
+mod untouched_tests;
