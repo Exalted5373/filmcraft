@@ -87,6 +87,24 @@ fn bit_exact_with_the_software_decoder() {
     }
 }
 
+/// Where the driver gives no page-locked memory, pictures are copied into ordinary memory after
+/// the post-processing on the readback stream is done: the same frames as the software decoder.
+#[test]
+fn bit_exact_through_ordinary_memory() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    for (name, s) in streams(&ff) {
+        let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
+        let Ok(mut nv) = NvDecoder::new(info) else {
+            eprintln!("SKIPPED: no NVDEC hardware decoder for {name}");
+            continue;
+        };
+        nv.read_back_without_page_locked_memory();
+        let a = decode_all(&mut nv, &s.samples);
+        assert!(a.len() >= 40, "{name}: {} pictures", a.len());
+        assert_same(&format!("{name} through ordinary memory"), &a, &decode_all(software(&s).as_mut(), &s.samples));
+    }
+}
+
 #[test]
 fn mid_stream_failure_continues_in_software() {
     let ff = filmcraft_testkit::require_ffmpeg!();

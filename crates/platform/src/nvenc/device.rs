@@ -138,6 +138,8 @@ mod cuda {
 
     impl Device {
         pub const KIND: u32 = super::super::ffi::NV_ENC_DEVICE_TYPE_CUDA;
+        /// Load the CUDA driver, resolve the functions used here and retain device 0's primary
+        /// context; an error without a driver or device.
         pub fn new() -> Result<Self, String> {
             // SAFETY: CUDA driver API signatures from NVIDIA's public Driver API reference.
             // Resolve all symbols before retaining; keep the library alive until after release
@@ -196,10 +198,12 @@ mod cuda {
                 })
             }
         }
+        /// The retained context, the handle NVENC sessions are opened with.
         pub fn as_raw(&self) -> *mut c_void {
             self.context
         }
 
+        /// Make this context current on the calling thread until the guard is dropped.
         pub fn push_current(&self) -> Result<Current<'_>, String> {
             // SAFETY: signatures match the CUDA driver headers; the retained context and
             // library outlive the guard, whose Drop balances the push on this same thread.
@@ -233,6 +237,15 @@ mod cuda {
                     self.no_stream.set(true);
                     std::ptr::null_mut()
                 }
+            }
+        }
+
+        /// Copy into ordinary memory from now on, as where the driver gives no page-locked memory
+        /// (a test hook of the decoders).
+        pub fn read_back_without_page_locked_memory(&self) {
+            self.no_pinned.set(true);
+            if let Some(pinned) = self.staging.try_borrow_mut().ok().and_then(|mut s| s.take()) {
+                self.free_pinned(pinned);
             }
         }
 
@@ -282,6 +295,15 @@ mod cuda {
             let mut host = Vec::new();
             host.try_reserve_exact(len).map_err(|e| format!("CUDA readback allocation failed: {e}"))?;
             host.resize(len, 0);
+            // The picture's post-processing ran on the readback stream if there is one, and the
+            // synchronous copy below (default stream) does not wait for a non-blocking stream.
+            if let (Some(stream), Some(api)) = (self.stream.get(), self.streams) {
+                // SAFETY: a stream this device created; the context is current and the library loaded.
+                let st = unsafe { (api.synchronize)(stream.as_ptr()) };
+                if st != 0 {
+                    return Err(format!("cuStreamSynchronize failed ({st})"));
+                }
+            }
             // SAFETY: the synchronous copy writes at most `host.len()` bytes into the live
             // vector; the context is current and the library loaded.
             let st = unsafe { (self.copy)(host.as_mut_ptr().cast(), source, host.len()) };
@@ -308,6 +330,8 @@ mod cuda {
             Some(Pinned { ptr, len })
         }
 
+        /// Give a page-locked buffer back to the driver, with this context current; a failure is
+        /// logged and the buffer leaked.
         fn free_pinned(&self, pinned: Pinned) {
             let Some((_, free)) = self.host else { return };
             match self.push_current() {
@@ -325,6 +349,7 @@ mod cuda {
     }
 
     impl Drop for Current<'_> {
+        /// Pop the context this guard pushed.
         fn drop(&mut self) {
             let mut previous = std::ptr::null_mut();
             // SAFETY: this guard owns one successful push on this thread; previous is
@@ -337,6 +362,8 @@ mod cuda {
     }
 
     impl Drop for Device {
+        /// Destroy the readback stream and free the staging buffer while the context is still
+        /// retained, then release the context.
         fn drop(&mut self) {
             // the stream and the page-locked buffer belong to the context: release them while the
             // context is retained (every copy into the buffer was waited for)

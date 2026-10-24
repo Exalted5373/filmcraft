@@ -64,6 +64,12 @@ impl NvDecoder {
     pub fn fail_after(&mut self, n: u64) {
         self.fail_after = Some(n);
     }
+
+    /// Test hook: read pictures back through ordinary memory, as where the driver gives no
+    /// page-locked memory.
+    pub fn read_back_without_page_locked_memory(&mut self) {
+        self.session.read_back_without_page_locked_memory();
+    }
 }
 
 fn frames(out: Vec<(i64, filmcraft_frame::VideoFrame)>) -> Vec<DecodedFrame> {

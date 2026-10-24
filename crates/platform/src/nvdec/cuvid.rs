@@ -196,6 +196,8 @@ impl State {
         }
         Ok(())
     }
+    /// Map displayed picture `info`, read it back into a planar frame and queue it with its
+    /// timestamp; the mapping is released on every path.
     fn map_picture(&mut self, info: &CUVIDPARSERDISPINFO) -> Result<(), String> {
         // SAFETY: this C struct contains integers and nullable pointers only.
         let mut proc: CUVIDPROCPARAMS = unsafe { std::mem::zeroed() };
@@ -219,6 +221,8 @@ impl State {
         self.ready.push((info.timestamp, frame));
         Ok(())
     }
+    /// The mapped picture at `address` (`pitch` bytes per row) as a planar frame, copied through
+    /// the device's readback buffer; errors for a null mapping or a queue over its memory limit.
     fn readback(&self, address: u64, pitch: u32) -> Result<VideoFrame, String> {
         if address == 0 {
             return Err("NVDEC returned a null mapped address".into());
@@ -246,6 +250,8 @@ impl State {
         })?
     }
 }
+/// The luma plane's size and the whole mapped picture's (luma then half-height interleaved
+/// chroma) at `pitch` bytes per row, or an error for sizes the decoder cannot have produced.
 fn mapped_layout(coded: (u32, u32), bits: u32, pitch: u32) -> Result<(usize, usize), String> {
     let row_bytes = coded.0.checked_mul(if bits == 10 { 2 } else { 1 }).ok_or("NVDEC row size overflows")?;
     if pitch < row_bytes || pitch == 0 || coded.1 == 0 || !coded.1.is_multiple_of(2) || !matches!(bits, 8 | 10) {
@@ -538,6 +544,11 @@ impl Session {
         if let Err(e) = self.restart() {
             log::warn!("NVDEC reset failed: {e}");
         }
+    }
+    /// Read pictures back through ordinary memory from now on (see
+    /// [`NvDecoder::read_back_without_page_locked_memory`](super::NvDecoder::read_back_without_page_locked_memory)).
+    pub fn read_back_without_page_locked_memory(&mut self) {
+        self.device.read_back_without_page_locked_memory();
     }
 }
 impl Drop for Session {
