@@ -65,8 +65,9 @@ pub enum Error {
     InvalidConfig(String),
     #[error("input frame planes too small for the configured size")]
     BadFrame,
-    /// A GOP of the GOP-parallel path failed (its thread panicked): its pictures are lost, later
-    /// GOPs and calls are unaffected.
+    /// A GOP of the GOP-parallel path failed (its thread panicked): its pictures are lost, and the
+    /// stream goes on from an IDR when it would have continued from that GOP. Later calls are
+    /// unaffected.
     #[error("H.264 GOP encoding failed: {0}")]
     Worker(String),
 }
@@ -747,10 +748,15 @@ impl Encoder {
 
     /// Encode one picture: zero or more packets in decoding order. [`Error::BadFrame`] if the
     /// planes are smaller than the configured size; [`Error::Worker`] if a GOP of the GOP-parallel
-    /// path failed (the picture was taken; packets of other GOPs come with the next call).
+    /// path failed (the picture was taken; packets of other GOPs come with the next call). After a
+    /// failure the next picture not scheduled yet is coded as an IDR, so no later picture refers to
+    /// the lost ones.
     pub fn try_encode(&mut self, frame: &YuvFrame, pts: i64) -> Result<Vec<Packet>, Error> {
         #[cfg(feature = "threads")]
-        self.gop_make_room();
+        {
+            self.gop_check();
+            self.gop_make_room();
+        }
         let src = self.import(frame)?;
         let cfg = &self.ctx.cfg;
         let use_aq = cfg.aq_strength > 0.0 && !matches!(cfg.rate, RateControl::Qp(_));
@@ -770,11 +776,16 @@ impl Encoder {
             self.all_pts.push(pts);
         }
         let input = Input { frame: src, pts, display, cplx, aq };
+        #[cfg(feature = "threads")]
+        let restart = self.gop_restart();
+        #[cfg(not(feature = "threads"))]
+        let restart = false;
+        let cfg = &self.ctx.cfg;
         let since = display - self.last_idr;
         let fps = cfg.fps_num as f64 / cfg.fps_den as f64;
         let min_gap = (fps / 2.0).max(1.0) as u64;
         let scenecut = cfg.scenecut && display > 0 && since >= min_gap && cplx.inter as f64 > 0.75 * cplx.intra as f64;
-        let idr = display == 0 || since >= cfg.keyint as u64 || scenecut;
+        let idr = restart || display == 0 || since >= cfg.keyint as u64 || scenecut;
         if idr {
             self.flush_minigop();
             self.last_idr = display;
@@ -792,6 +803,11 @@ impl Encoder {
     /// path waits for all its GOPs). The stream may continue afterwards. [`Error::Worker`] if a
     /// GOP failed: its pictures are lost, the other packets come with the next call.
     pub fn flush(&mut self) -> Result<Vec<Packet>, Error> {
+        #[cfg(feature = "threads")]
+        {
+            self.gop_check();
+            self.gop_restart();
+        }
         self.flush_minigop();
         #[cfg(feature = "threads")]
         self.gop_finish();

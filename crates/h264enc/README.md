@@ -87,9 +87,12 @@ With the `threads` feature (on by default) the encoder has its own rayon pool of
   half-sample planes, reconstructions) stay within 1 GiB of padded pictures; `try_encode` waits for the
   oldest GOP when the next picture would pass it. When two GOPs of `keyint` pictures do not fit (1080p
   with `keyint` 250, 4K with a 2-second `keyint`), or with one thread, the encoder stays serial. A GOP
-  thread that panics turns into `Error::Worker` for that GOP (its packets are lost, the other GOPs and later
-  calls carry on). Dropping the encoder stops every GOP thread after its current batch and waits for it, so
-  the GOPs' pictures, buffers and pool work are released by the time the drop returns.
+  thread that panics turns into `Error::Worker`, returned by the first `try_encode` / `flush` after its
+  death is noticed: that GOP's remaining packets are lost, it takes no more pictures, and when the stream
+  would have continued from it the next picture is coded as an IDR, so no later picture refers to a lost
+  one; the other GOPs and later calls carry on. Dropping the encoder stops every GOP thread after its
+  current batch and waits for it, so the GOPs' pictures, buffers and pool work are released by the time
+  the drop returns.
   `EncoderConfig::parallel_gops = false` forces the serial path; `gop_parallel()` says which path an encoder
   took. Measurements: `docs/performance.md`, "H.264: CRF and constant-QP GOPs in parallel".
 
