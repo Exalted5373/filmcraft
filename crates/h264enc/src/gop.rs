@@ -24,6 +24,8 @@
 //! reconstructions) are taken (`Encoder::deliver`) as they are coded once every GOP before it is
 //! done, so a packet never comes out before one that precedes it. Memory is bounded by
 //! [`GOP_BUFFER_BYTES`]. A GOP thread that panics becomes [`Error::Worker`] for that GOP only.
+//! Dropping the encoder stops every GOP thread after its current batch and waits for it, so the
+//! GOPs' pictures, buffers and pool work are released by the time the drop returns.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -78,6 +80,45 @@ pub(crate) struct Gops {
     /// Make the GOP with this number panic on its thread.
     #[cfg(test)]
     pub(crate) plant_panic: Option<u64>,
+    /// Make every GOP thread hold its batches until the encoder goes away, then take a while over
+    /// the one it is coding, as a GOP busy with a long batch would.
+    #[cfg(test)]
+    plant_hold: bool,
+    /// GOP threads started and not ended yet.
+    #[cfg(test)]
+    live: Arc<AtomicUsize>,
+}
+
+/// The test hooks a GOP thread starts with.
+#[cfg(test)]
+struct Plant {
+    /// Panic on the thread.
+    panic: bool,
+    /// See [`Gops::plant_hold`].
+    hold: bool,
+    /// Counts the thread in [`Gops::live`] until it ends.
+    alive: Alive,
+}
+
+/// One GOP thread counted in [`Gops::live`], from before it is started until it ends.
+#[cfg(test)]
+struct Alive(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl Alive {
+    /// Count one more thread in `live`.
+    fn new(live: &Arc<AtomicUsize>) -> Alive {
+        live.fetch_add(1, Ordering::SeqCst);
+        Alive(Arc::clone(live))
+    }
+}
+
+#[cfg(test)]
+impl Drop for Alive {
+    /// The thread ended (or was never started).
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// One GOP (or the rest of one, after a flush) and what codes it.
@@ -118,7 +159,7 @@ enum Next {
 
 impl Gop {
     /// Start coding a GOP from `refs` on a thread (or here, when no thread can be had).
-    fn start(ctx: &Arc<Ctx>, fixed: FixedQp, refs: Refs, cancel: &Arc<AtomicBool>, #[cfg(test)] plant_panic: bool) -> Gop {
+    fn start(ctx: &Arc<Ctx>, fixed: FixedQp, refs: Refs, cancel: &Arc<AtomicBool>, #[cfg(test)] plant: Plant) -> Gop {
         let coded = Arc::new(AtomicUsize::new(0));
         let (batch_tx, batch_rx) = mpsc::channel::<Batch>();
         let (out_tx, out_rx) = mpsc::channel::<Out>();
@@ -126,8 +167,18 @@ impl Gop {
         let (refs_tx, refs_rx) = mpsc::sync_channel::<Refs>(1);
         let (c, count, stop) = (Arc::clone(ctx), Arc::clone(&coded), Arc::clone(cancel));
         let body = move || -> Result<Refs, String> {
+            #[cfg(test)]
+            let Plant { panic: plant_panic, hold, alive: _alive } = plant;
             let refs = refs_rx.recv().map_err(|_| "the GOP never reached its thread".to_string())?;
             catch_unwind(AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if hold {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // the rest of a long batch
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 #[cfg(test)]
                 if plant_panic {
                     // from a pool task, as a panic in a slice would come
@@ -249,6 +300,7 @@ fn code(ctx: &Ctx, fixed: FixedQp, mut refs: Refs, batches: &mpsc::Receiver<Batc
     refs
 }
 
+/// The message of a panic payload (a `String` or `&str`), or "panic" for any other payload.
 fn panic_text(p: Box<dyn Any + Send>) -> String {
     match p.downcast::<String>() {
         Ok(s) => *s,
@@ -288,6 +340,10 @@ impl Gops {
             cancel: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             plant_panic: None,
+            #[cfg(test)]
+            plant_hold: false,
+            #[cfg(test)]
+            live: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -296,19 +352,36 @@ impl Gops {
         self.gops.iter().map(|g| g.uncoded() + self.work).sum::<usize>() + inputs + SPARE_FRAMES
     }
 
+    /// The pool that analyses the input pictures, if it could be built.
     pub(crate) fn analysis_pool(&self) -> Option<&rayon::ThreadPool> {
         self.analysis.as_ref()
     }
 
+    /// The open GOP (the newest one, unless a flush closed it).
     fn open(&mut self) -> Option<&mut Gop> {
         self.gops.back_mut().filter(|g| g.open)
     }
 }
 
 impl Drop for Gops {
+    /// Stop the GOP threads and wait for them: each ends after its current batch at most, so the
+    /// GOPs' reference pictures, buffers and pool work are released before the encoder is gone. A
+    /// thread that panicked is joined without passing the panic on.
     fn drop(&mut self) {
-        // threads waiting for batches end when their channel closes, coding ones after their batch
         self.cancel.store(true, Ordering::Relaxed);
+        // every channel closes before the first wait: a thread waiting for a batch then ends, and
+        // no GOP thread waits for this one
+        for g in &mut self.gops {
+            g.close();
+        }
+        for g in &mut self.gops {
+            if let Coder::Thread { handle, .. } = &mut g.coder
+                && let Some(h) = handle.take()
+            {
+                // the encoder is going away: the GOP's result, or its panic, has no one to go to
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -352,7 +425,7 @@ impl Encoder {
                 self.refs.take_state()
             };
             #[cfg(test)]
-            let plant_panic = g.plant_panic == Some(g.next_seq);
+            let plant = Plant { panic: g.plant_panic == Some(g.next_seq), hold: g.plant_hold, alive: Alive::new(&g.live) };
             g.next_seq += 1;
             let gop = Gop::start(
                 &self.ctx,
@@ -360,7 +433,7 @@ impl Encoder {
                 refs,
                 &g.cancel,
                 #[cfg(test)]
-                plant_panic,
+                plant,
             );
             g.gops.push_back(gop);
         }
@@ -439,6 +512,9 @@ impl Encoder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
     use crate::{Encoder, EncoderConfig, Error, Packet, YuvFrame};
 
     /// A slowly moving gradient (no scene cuts).
@@ -448,6 +524,7 @@ mod tests {
         [y, c.clone(), c]
     }
 
+    /// A GOP-parallel encoder (64x48, `keyint` 4, three threads), the GOP numbered `plant` panicking.
     fn encoder(plant: Option<u64>) -> Encoder {
         let mut c = EncoderConfig::new(64, 48, 10, 1);
         c.keyint = 4;
@@ -485,6 +562,8 @@ mod tests {
         (packets, failures)
     }
 
+    /// A panic on one GOP thread is reported once as `Error::Worker`; the packets of that GOP are
+    /// lost and every other packet comes out unchanged.
     #[test]
     fn a_panicking_gop_is_an_error_and_the_other_gops_still_come() {
         let (all, failures) = run(encoder(None));
@@ -500,6 +579,7 @@ mod tests {
         }
     }
 
+    /// Dropping an encoder whose GOPs still have batches to code returns.
     #[test]
     fn dropping_an_encoder_with_gops_running_returns() {
         let mut enc = encoder(None);
@@ -509,5 +589,30 @@ mod tests {
             enc.try_encode(&frame, t as i64).unwrap();
         }
         drop(enc);
+    }
+
+    /// Dropping the encoder waits for its GOP threads: every one was still busy with a batch when
+    /// the drop began, and none is left once it returns.
+    #[test]
+    fn no_gop_thread_outlives_its_encoder() {
+        let mut enc = encoder(None);
+        let live = {
+            let g = enc.gops.as_mut().unwrap();
+            g.plant_hold = true;
+            Arc::clone(&g.live)
+        };
+        for t in 0..12 {
+            let [y, u, v] = picture(64, 48, t);
+            let frame = YuvFrame { y: &y, u: &u, v: &v, y_stride: 64, uv_stride: 32 };
+            enc.try_encode(&frame, t as i64).unwrap();
+        }
+        let (gops, busy) = {
+            let gops = &enc.gops.as_ref().unwrap().gops;
+            (gops.len(), gops.iter().all(|g| g.uncoded() > 0))
+        };
+        assert!(gops >= 2 && busy, "{gops} GOPs, all still coding: {busy}");
+        assert_eq!(live.load(Ordering::SeqCst), gops);
+        drop(enc);
+        assert_eq!(live.load(Ordering::SeqCst), 0, "GOP threads left after the drop");
     }
 }
