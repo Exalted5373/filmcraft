@@ -81,11 +81,18 @@ fn add_media(p: &mut Project, m: &mut SourceMap, name: &str, source: impl FnOnce
     id
 }
 
-/// One second of a camera clip on V1 of a `W` x `H` sequence (two video tracks), then `edit`.
+/// One second of a camera clip on V1 of a `W` x `H` sequence (two video tracks), then `edit`. The
+/// camera declares the colour and alpha its frames have, as a file's stream description would.
 fn camera_project(color: ColorInfo, chroma: Chroma, alpha: bool, edit: impl FnOnce(&mut Project, ItemId, &mut SourceMap)) -> (Arc<Project>, ItemId, SourceMap) {
     let mut p = Project::new("untouched");
     let mut m = SourceMap::default();
-    let cam = add_media(&mut p, &mut m, "camera", |info| Arc::new(Camera { info, color, chroma, alpha }));
+    let cam = add_media(&mut p, &mut m, "camera", |mut info| {
+        if let Some(v) = info.video.as_mut() {
+            v.color = color;
+            v.has_alpha = alpha;
+        }
+        Arc::new(Camera { info, color, chroma, alpha })
+    });
     let seq = p.new_sequence("s", SequenceSettings { width: W, height: H, frame_rate: RATE, ..Default::default() }, 2, 1, None);
     let clip = p.make_track_item(cam, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, RATE.tick_of(24)), RATE).unwrap();
     p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
@@ -299,29 +306,33 @@ impl MediaSource for Counting {
     }
 }
 
-/// A source whose decoded frames cannot go to the encoder as they are (BT.601, 4:2:2) is decoded
-/// once to find that out: every later frame of it is only decoded by the renderer, not twice.
+/// A source that declares frames the encoder can't take as they are (BT.601, full range, alpha)
+/// is never decoded to look at them: the renderer asks it for each frame once, on any core count.
 #[test]
-fn a_source_that_does_not_qualify_is_decoded_once_per_frame() {
-    for (name, color, chroma) in [("601", ColorInfo { matrix: Matrix::Bt601, ..ColorInfo::REC709 }, Chroma::C420), ("422", ColorInfo::REC709, Chroma::C422)] {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = calls.clone();
-        let (p, seq, m) = camera_project(color, chroma, false, move |_, _, m| {
-            for source in m.0.values_mut() {
-                *source = Arc::new(Counting { inner: source.clone(), calls: counter.clone() });
-            }
-        });
-        let s = h264(&format!("count-{name}.mp4"));
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        pool.install(|| {
-            let prog = Progress::default();
-            let mut ex = Exporter::new(p, seq, &s, &prog).unwrap();
-            ex.set_batch(1);
-            ex.set_overlap(false);
-            ex.set_untouched(true);
-            while !matches!(ex.step(&m, &prog).unwrap(), Step::Done(_)) {}
-        });
-        // 24 frames rendered, and the first one also decoded to look at its samples
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 24 + 1, "{name}: frames asked of the source");
+fn a_source_that_declares_other_frames_is_decoded_once_per_frame() {
+    let cases = [
+        ("601", ColorInfo { matrix: Matrix::Bt601, ..ColorInfo::REC709 }, false),
+        ("full range", ColorInfo { range: Range::Full, ..ColorInfo::REC709 }, false),
+        ("alpha", ColorInfo::REC709, true),
+    ];
+    for (name, color, alpha) in cases {
+        for threads in [1, 4] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = calls.clone();
+            let (p, seq, m) = camera_project(color, Chroma::C420, alpha, move |_, _, m| {
+                for source in m.0.values_mut() {
+                    *source = Arc::new(Counting { inner: source.clone(), calls: counter.clone() });
+                }
+            });
+            let s = h264(&format!("count-{name}-{threads}.mp4"));
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                let prog = Progress::default();
+                let mut ex = Exporter::new(p, seq, &s, &prog).unwrap();
+                ex.set_untouched(true);
+                while !matches!(ex.step(&m, &prog).unwrap(), Step::Done(_)) {}
+            });
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 24, "{name}, {threads} threads: frames asked of the source");
+        }
     }
 }

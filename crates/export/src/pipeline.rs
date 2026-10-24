@@ -3,8 +3,7 @@
 //! apply the Export effects (image, name and timecode overlays, video limiter) and convert to the
 //! encoder's input (straight sRGB RGBA8, or encoded R'G'B' floats for HDR).
 
-use std::collections::HashSet;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::{ItemId, Project};
@@ -136,9 +135,6 @@ pub(crate) struct Pipeline {
     /// sequence's own size): an untouched frame can go to the encoder as decoded
     /// ([`Pipeline::untouched_yuv420`]).
     passthrough: bool,
-    /// Media items whose decoded frames [`yuv420_of`] refused (another sampling, matrix, range or
-    /// size: a property of the source): their frames are rendered without trying them again.
-    not_yuv420: RwLock<HashSet<ItemId>>,
     start_tc: i64,
     drop_frame: bool,
     /// Free the pool's float images when the export ends: a standalone export, not one part of a
@@ -243,7 +239,6 @@ impl Pipeline {
             effects,
             overlay,
             passthrough,
-            not_yuv420: RwLock::default(),
         })
     }
 
@@ -310,23 +305,20 @@ impl Pipeline {
     /// on it ([`filmcraft_render::plan::untouched_frame`]) and this export changes nothing about it:
     /// [`Pipeline::frame`] and the encoder's conversion would only turn it into linear light and
     /// back to (nearly, give or take a code) the same samples. None for every other frame. A source
-    /// whose decoded frame does not qualify is remembered and not decoded here again: its frames
-    /// would be planned and decoded twice, here and by the renderer.
+    /// that declares frames this cannot take ([`declares_yuv420`]: alpha, another matrix, range,
+    /// transfer or size) is not decoded here at all, so the renderer is the only one to plan and
+    /// decode its frames. That depends on the source alone, never on the frames before.
     pub fn untouched_yuv420(&self, f: i64, sources: &dyn SourceProvider) -> Option<Yuv420> {
         if !self.passthrough {
             return None;
         }
         let t = self.rate.tick_of(f);
         let item = filmcraft_render::plan::untouched_source(&self.project, self.seq, t, self.opts)?;
-        if self.not_yuv420.read().unwrap_or_else(PoisonError::into_inner).contains(&item) {
+        if !sources.source(item)?.info().video.as_ref().is_some_and(|v| declares_yuv420(v, self.w, self.h)) {
             return None;
         }
         let frame = filmcraft_render::plan::untouched_frame(&self.project, self.seq, t, self.opts, sources)?;
-        let planes = yuv420_of(&frame, self.w, self.h);
-        if planes.is_none() {
-            self.not_yuv420.write().unwrap_or_else(PoisonError::into_inner).insert(item);
-        }
-        planes
+        yuv420_of(&frame, self.w, self.h)
     }
 
     /// Fit the rendered picture into the output frame.
@@ -419,6 +411,20 @@ pub(crate) fn yuv420_of(frame: &filmcraft_frame::VideoFrame, w: u32, h: u32) -> 
     let chroma = w.div_ceil(2).checked_mul(h.div_ceil(2))?;
     let [y, u, v] = planes;
     Some(Yuv420 { y: y.get(..w.checked_mul(h)?)?.to_vec(), u: u.get(..chroma)?.to_vec(), v: v.get(..chroma)?.to_vec() })
+}
+
+/// Whether a source whose video stream is `v` may decode to frames [`yuv420_of`] takes for a
+/// `w` x `h` export: no alpha, BT.709 matrix, limited range, a BT.709 or sRGB transfer, and the
+/// export's size. The sampling and bit depth are not declared in a form to check: the frame itself
+/// decides those.
+fn declares_yuv420(v: &filmcraft_media::VideoStreamInfo, w: u32, h: u32) -> bool {
+    use filmcraft_color::{Matrix, Range, Transfer};
+    let c = v.color;
+    !v.has_alpha
+        && (v.width, v.height) == (w, h)
+        && c.matrix == Matrix::Bt709
+        && c.range == Range::Limited
+        && matches!(c.transfer, Transfer::Bt709 | Transfer::Srgb)
 }
 
 /// Top-left of a `bw`×`bh` box placed in a `w`×`h` frame (3 % margin) plus `offset`.

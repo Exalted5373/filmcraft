@@ -294,7 +294,7 @@ pub fn untouched_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderO
 
 /// The media item [`untouched_frame`] would decode for the frame of `seq_id` at `t`, from the
 /// timeline alone (nothing is planned or decoded). None where [`untouched_frame`] returns None
-/// without planning. A caller that learnt a source never decodes to frames it can use skips it.
+/// without planning. A caller can look at what that source declares before anything is decoded.
 pub fn untouched_source(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions) -> Option<ItemId> {
     let seq = project.sequence(seq_id)?;
     sole_plain_clip(project, seq, t, opts).map(|clip| clip.item)
