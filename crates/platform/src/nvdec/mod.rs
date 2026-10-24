@@ -72,6 +72,7 @@ impl NvDecoder {
     }
 }
 
+/// The session's pictures as decoded frames (never draft).
 fn frames(out: Vec<(i64, filmcraft_frame::VideoFrame)>) -> Vec<DecodedFrame> {
     out.into_iter().map(|(pts, frame)| DecodedFrame { pts, frame, draft: false }).collect()
 }

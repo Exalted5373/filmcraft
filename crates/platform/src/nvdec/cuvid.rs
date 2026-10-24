@@ -173,6 +173,7 @@ impl State {
         self.surfaces = surfaces;
         i32::try_from(surfaces).map_err(|_| "NVDEC surface count overflows".into())
     }
+    /// Queue a picture the parser shows (a valid surface of a progressive frame) for readback.
     fn display(&mut self, info: &CUVIDPARSERDISPINFO) -> Result<i32, String> {
         if self.decoder.is_null()
             || info.picture_index < 0
@@ -189,6 +190,8 @@ impl State {
         self.pending.push(*info);
         Ok(1)
     }
+    /// Read back every picture the parser queued for display, before another decode can reuse their
+    /// surfaces.
     fn drain(&mut self) -> Result<(), String> {
         // Copy queued displays before another decode can recycle their picture indices.
         for info in std::mem::take(&mut self.pending) {
@@ -529,6 +532,8 @@ impl Session {
             None => Ok(()),
         }
     }
+    /// Drop the queued pictures and the latched error and recreate the parser, keeping the decoder;
+    /// a failure is latched as the session's error.
     fn restart(&mut self) -> Result<(), String> {
         let state = self.state();
         state.ready.clear();
@@ -540,6 +545,8 @@ impl Session {
         }
         result
     }
+    /// Start over (a seek): the queued pictures are dropped and the parser recreated; the decoder
+    /// is kept. A failure is logged and left for the next feed to report.
     pub fn reset(&mut self) {
         if let Err(e) = self.restart() {
             log::warn!("NVDEC reset failed: {e}");
@@ -552,6 +559,8 @@ impl Session {
     }
 }
 impl Drop for Session {
+    /// Destroy the parser and the decoder, then free the callback state (leaked instead if the
+    /// parser could not be destroyed, as it would still point at it).
     fn drop(&mut self) {
         if let Err(e) = self.destroy(false) {
             log::warn!("NVDEC cleanup failed: {e}");
