@@ -536,7 +536,7 @@ fn an_mxf_source_copies_too() {
     let mxf = ExportSettings { format: Format::MxfOp1a, mxf_video_codec: MxfVideoCodec::ProRes, ..prores("src.mxf", "hq") };
     let (mxf_bytes, _) = export_with(p, seq, &m, &mxf, 2, 4, true, false);
     let mxf_src = filmcraft_codecs::open_bytes("src.mxf", mxf_bytes.into()).unwrap();
-    let wanted: Vec<Vec<u8>> = (0..N).map(|k| mxf_src.compressed_video_sample(RATE.tick_of(k as i64)).unwrap().unwrap().data).collect();
+    let wanted: Vec<Vec<u8>> = (0..N).map(|k| mxf_src.compressed_video_sample(RATE.tick_of(k as i64), u64::MAX).unwrap().unwrap().data).collect();
     let mxf_path = mxf.path.clone();
     let (p, seq, m) = project(&mxf_path, mxf_src, seq_settings(), |_, _, _, _| {});
     let (bytes, copied) = export(p, seq, &m, &prores("from-mxf.mov", "hq"));
@@ -576,7 +576,7 @@ fn the_colour_the_source_decodes_with_decides_a_copy() {
     for (k, (name, (w, h), colr, codes, want)) in cases.into_iter().enumerate() {
         let samples = prores_samples_sized(Profile::Hq, w, h, 1, false, codes);
         let (_, src) = unlabelled_mov(&format!("colour-{k}.mov"), entry(w, h, colr), RATE, &samples);
-        let sample = src.compressed_video_sample(Tick::ZERO).unwrap().unwrap();
+        let sample = src.compressed_video_sample(Tick::ZERO, u64::MAX).unwrap().unwrap();
         let decoded = src.video_frame(FrameRequest::full(Tick::ZERO)).unwrap().color;
         let copy =
             SampleCopy { flavour: CopyFlavour::ProRes { profile: Profile::Hq, alpha: false }, width: w, height: h, rate: RATE, signal: ColorSignal::default() };
@@ -587,7 +587,7 @@ fn the_colour_the_source_decodes_with_decides_a_copy() {
     // DNxHR without colour decodes as BT.709 too
     let dnx = dnx_samples(filmcraft_dnx::Profile::Hq, 1);
     let (_, src) = unlabelled_mov("colour-dnx.mov", SampleEntry::dnx(FourCc(*b"AVdh"), W as u16, H as u16), RATE, &dnx);
-    let sample = src.compressed_video_sample(Tick::ZERO).unwrap().unwrap();
+    let sample = src.compressed_video_sample(Tick::ZERO, u64::MAX).unwrap().unwrap();
     assert_eq!((sample.color, src.video_frame(FrameRequest::full(Tick::ZERO)).unwrap().color), (Some(ColorInfo::REC709), ColorInfo::REC709));
     let dnx_copy = SampleCopy {
         flavour: CopyFlavour::DnxHr { profile: filmcraft_dnx::Profile::Hq, bit_depth: 8 },
@@ -604,4 +604,133 @@ fn the_colour_the_source_decodes_with_decides_a_copy() {
     assert_eq!(copies(&path, src, seq_settings(), none, &prores("colour-sd-out.mov", "hq")), N as u64, "SD without colour");
     let (path, src) = unlabelled_mov("colour-sd-colr.mov", entry(W, H, colr_unspecified), RATE, &samples);
     assert_eq!(copies(&path, src, seq_settings(), none, &prores("colour-sd-colr-out.mov", "hq")), 0, "SD, colr without a matrix");
+}
+
+/// `frame` with `n` zero bytes after the slices of its (first) picture, the picture and frame sizes
+/// grown to cover them: a decoder skips them, so it decodes as before.
+fn pad_picture(frame: &[u8], n: usize) -> Vec<u8> {
+    let off = 8 + usize::from(u16::from_be_bytes([frame[8], frame[9]]));
+    let pic = u32::from_be_bytes(frame[off + 1..off + 5].try_into().unwrap()) as usize;
+    let mut v = frame.to_vec();
+    v.splice(off + pic..off + pic, std::iter::repeat_n(0u8, n));
+    v[off + 1..off + 5].copy_from_slice(&((pic + n) as u32).to_be_bytes());
+    let size = v.len() as u32;
+    v[0..4].copy_from_slice(&size.to_be_bytes());
+    v
+}
+
+/// A ProRes sample whose sizes are consistent but which carries bytes no slice covers, inside its
+/// picture or after it, decodes like the frame without them but is rendered and encoded instead
+/// of copied (its size would not follow from what it codes), and the export succeeds. The padded
+/// samples stay under the per-frame cap, so the frame check is what refuses them.
+#[test]
+fn padded_prores_samples_are_rendered() {
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    let mut samples = prores_samples(filmcraft_prores::Profile::Hq, N, false, Default::default());
+    let cap = crate::job::frame_bytes(W, H, false) as usize;
+    // 3: padding inside the picture, after its slices; 5: padding after the last picture
+    samples[3] = pad_picture(&samples[3], 64 << 10);
+    samples[5].extend(std::iter::repeat_n(0u8, 64 << 10));
+    let size = samples[5].len() as u32;
+    samples[5][0..4].copy_from_slice(&size.to_be_bytes());
+    for k in [3, 5] {
+        assert!(samples[k].len() < cap, "sample {k} is over the size cap");
+        let padded = filmcraft_prores::decode_frame(&samples[k]).expect("a padded frame decodes");
+        assert!(padded == filmcraft_prores::decode_frame(&prores_samples(filmcraft_prores::Profile::Hq, N, false, Default::default())[k]).unwrap());
+    }
+    let (path, src) = mov("padded.mov", prores_entry(filmcraft_prores::Profile::Hq), RATE, &samples);
+    let (p, seq, m) = project(&path, src, seq_settings(), none);
+    let (bytes, copied) = export(p, seq, &m, &prores("padded-out.mov", "hq"));
+    assert_eq!(copied, N as u64 - 2);
+    let (out, _, _, _) = video_samples(&bytes);
+    for k in [3, 5] {
+        assert!(out[k] != samples[k], "padded sample {k} was copied");
+        filmcraft_prores::check_frame(&out[k]).expect("re-encoded frame");
+    }
+}
+
+/// An in-memory reader that counts the bytes it is asked for and remembers the largest read.
+struct CountingReader {
+    inner: filmcraft_media::reader::MemReader,
+    total: std::sync::atomic::AtomicU64,
+    largest: std::sync::atomic::AtomicU64,
+}
+
+impl filmcraft_media::reader::ByteReader for CountingReader {
+    /// The bytes' length.
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    /// Counts the read and passes it on.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.total.fetch_add(buf.len() as u64, SeqCst);
+        self.largest.fetch_max(buf.len() as u64, SeqCst);
+        self.inner.read_at(offset, buf)
+    }
+}
+
+/// A source that records the caps it is asked for compressed samples with.
+struct CapSeen {
+    inner: SharedSource,
+    caps: std::sync::Mutex<Vec<u64>>,
+}
+
+impl MediaSource for CapSeen {
+    /// The wrapped source's.
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    /// The wrapped source's frame.
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        self.inner.video_frame(req)
+    }
+    /// The wrapped source's audio.
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        self.inner.audio(start, frames, sample_rate)
+    }
+    /// Records `max_bytes` and passes the request on.
+    fn compressed_video_sample(&self, time: Tick, max_bytes: u64) -> filmcraft_media::Result<Option<filmcraft_media::CompressedSample>> {
+        self.caps.lock().unwrap().push(max_bytes);
+        self.inner.compressed_video_sample(time, max_bytes)
+    }
+}
+
+/// A sample over the caller's cap is refused from the sample table, before any of its bytes are
+/// read, also when the table declares one far larger than the file; within the cap it is read.
+/// The export's cap is the bytes its batches budget for one rendered frame.
+#[test]
+fn a_sample_over_the_cap_is_never_read() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (path, src, samples) = hq_source("cap.mov");
+    let bytes = std::fs::read(&path).unwrap();
+    let open = |bytes: Vec<u8>| {
+        let reader = Arc::new(CountingReader { inner: filmcraft_media::reader::MemReader(bytes.into()), total: 0.into(), largest: 0.into() });
+        let src = filmcraft_codecs::Mp4Source::open_reader("cap.mov", reader.clone()).unwrap();
+        (reader, src)
+    };
+    let (reader, mov) = open(bytes.clone());
+    let size = samples[0].len() as u64;
+    let before = reader.total.load(SeqCst);
+    let e = mov.compressed_video_sample(Tick::ZERO, size - 1).unwrap_err();
+    assert!(e.to_string().contains("over the"), "{e}");
+    assert_eq!(reader.total.load(SeqCst), before, "bytes were read for a sample over the cap");
+    assert!(mov.compressed_video_sample(Tick::ZERO, size).unwrap().unwrap().data == samples[0], "a sample at the cap is read");
+    // the sample table says the first sample is 300 MiB
+    let cap = crate::job::frame_bytes(W, H, false);
+    let mut lying = bytes;
+    let p = lying.windows(4).position(|w| w == b"stsz").unwrap();
+    assert_eq!(&lying[p + 8..p + 12], &[0u8; 4], "one size per sample");
+    lying[p + 16..p + 20].copy_from_slice(&(300u32 << 20).to_be_bytes());
+    let (reader, mov) = open(lying);
+    reader.largest.store(0, SeqCst);
+    assert!(mov.compressed_video_sample(Tick::ZERO, cap).is_err());
+    assert!(reader.largest.load(SeqCst) <= cap, "a read of {} bytes", reader.largest.load(SeqCst));
+    // the export asks with the bytes of one RGBA frame, and copies every frame within it
+    let seen = Arc::new(CapSeen { inner: src, caps: Default::default() });
+    let (p, seq, m) = project(&path, seen.clone(), seq_settings(), |_, _, _, _| {});
+    let (_, copied) = export(p, seq, &m, &prores("cap-out.mov", "hq"));
+    assert_eq!(copied, N as u64);
+    let caps = seen.caps.lock().unwrap();
+    assert!(caps.len() >= N && caps.iter().all(|&c| c == u64::from(W * H * 4)), "{caps:?}");
 }

@@ -944,6 +944,17 @@ pub(crate) fn intra_sample_color(codec: filmcraft_media::IntraCodec, sample: &[u
     }
 }
 
+/// The cap of [`filmcraft_media::MediaSource::compressed_video_sample`]: sample `i`, `size` bytes
+/// by the file's index, may be read only within `max_bytes` and
+/// [`filmcraft_media::MAX_COMPRESSED_SAMPLE`]; an error says why it is not.
+pub(crate) fn intra_sample_fits(i: usize, size: u64, max_bytes: u64) -> std::result::Result<(), filmcraft_media::MediaError> {
+    let cap = max_bytes.min(filmcraft_media::MAX_COMPRESSED_SAMPLE);
+    if size > cap {
+        return Err(filmcraft_media::MediaError::Unsupported(format!("video sample {i} is {size} bytes, over the {cap} allowed")));
+    }
+    Ok(())
+}
+
 impl VideoDecoder for DnxDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         let f = filmcraft_dnx::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;

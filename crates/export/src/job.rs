@@ -72,6 +72,9 @@
 //!   [`crate::smart`]): nothing is decoded, rendered or encoded for it. The render task makes the
 //!   decision, from the frame alone, so the file does not depend on the batch or core count either.
 //!   Copied and encoded frames are counted ([`crate::smart_render_stats`], [`Exporter::copied_frames`]).
+//!   A copied sample is never larger than a rendered frame ([`frame_bytes`], what the batch is
+//!   budgeted for): a larger one is not read from the file but rendered, and a ProRes sample must
+//!   be exactly what its frame codes (`filmcraft_prores::check_frame`), so the memory model holds.
 //! * **Timers.** `Render` and `Encode` are wall times of work that now runs at the same time, so
 //!   their sum may exceed the export's wall time; `Wait` is the time the encoding side then spent
 //!   waiting for the render (large: render-bound; near zero: encode-bound).

@@ -189,8 +189,8 @@ pub struct CompressedSample {
     pub data: Vec<u8>,
 }
 
-/// Largest compressed sample [`MediaSource::compressed_video_sample`] reads (sizes come from the
-/// file); a larger one is not handed out.
+/// Largest compressed sample [`MediaSource::compressed_video_sample`] reads whatever cap its caller
+/// gives (sizes come from the file); a larger one is not handed out.
 pub const MAX_COMPRESSED_SAMPLE: u64 = 512 << 20;
 
 pub trait MediaSource: Send + Sync {
@@ -209,9 +209,11 @@ pub trait MediaSource: Send + Sync {
     /// media time `time` (the same time-to-sample mapping), for streams of an intra-only codec
     /// ([`IntraCodec`]) whose decoded picture is the sample's picture as coded (no clean-aperture
     /// crop or display rotation applied by the source). `Ok(None)` for every other source, the
-    /// default; an error when the sample can't be read. Used to copy samples unchanged into an
+    /// default; an error when the sample can't be read, and when its size in the file's sample
+    /// table is over `max_bytes` (or [`MAX_COMPRESSED_SAMPLE`]): that is found before any of it is
+    /// read, so the caller's cap bounds what is allocated. Used to copy samples unchanged into an
     /// export of the same codec flavour (smart rendering).
-    fn compressed_video_sample(&self, _time: Tick) -> Result<Option<CompressedSample>> {
+    fn compressed_video_sample(&self, _time: Tick, _max_bytes: u64) -> Result<Option<CompressedSample>> {
         Ok(None)
     }
 }

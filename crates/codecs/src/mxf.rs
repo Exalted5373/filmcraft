@@ -464,8 +464,9 @@ impl MediaSource for MxfSource {
 
     /// The ProRes or VC-3 sample `video_frame` decodes for `time` (its display position), with the
     /// descriptor's size and pixel aspect and the colour the frame decodes with. None for other
-    /// codings and a track without a decoder.
-    fn compressed_video_sample(&self, time: Tick) -> Result<Option<CompressedSample>, MediaError> {
+    /// codings and a track without a decoder; an error, before reading, for a sample over
+    /// `max_bytes` in the index.
+    fn compressed_video_sample(&self, time: Tick, max_bytes: u64) -> Result<Option<CompressedSample>, MediaError> {
         let Some(ti) = self.vtrack.filter(|_| self.unsupported.is_none() && self.vcount > 0) else { return Ok(None) };
         let Some(track) = self.file.tracks.get(ti) else { return Ok(None) };
         let (codec, fourcc) = match track.codec {
@@ -479,10 +480,8 @@ impl MediaSource for MxfSource {
         let f = self.info.frame_rate().frame_at(time.max(Tick::ZERO)).clamp(0, self.vcount - 1);
         let shown = usize::try_from(self.vfirst + f).ok().and_then(|p| self.vorder.get(p).copied());
         let Some(i) = shown.or_else(|| self.vpts.len().checked_sub(1)) else { return Ok(None) };
-        let size = track.samples.get(i).map_or(0, |s| u64::from(s.size));
-        if size > filmcraft_media::MAX_COMPRESSED_SAMPLE {
-            return Err(MediaError::Unsupported(format!("video sample {i} is {size} bytes")));
-        }
+        let Some(sample) = track.samples.get(i) else { return Ok(None) };
+        crate::video::intra_sample_fits(i, u64::from(sample.size), max_bytes)?;
         let data = self.file.read_sample(&self.bytes, ti, i).map_err(|e| MediaError::Io(e.to_string()))?;
         let color = self.explicit_color.or_else(|| crate::video::intra_sample_color(codec, &data));
         Ok(Some(CompressedSample { codec, fourcc, width: v.width, height: v.height, color, par: v.par, index: i, data }))

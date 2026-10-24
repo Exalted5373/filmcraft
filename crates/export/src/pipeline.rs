@@ -325,7 +325,9 @@ impl Pipeline {
     /// on it, the timeline shows one source frame untouched
     /// ([`filmcraft_render::plan::untouched_clip`]), the clip plays its source forward at 100 %
     /// and at the output frame rate, and the sample the source would decode for it passes the
-    /// encoder's check ([`SampleCopy::check`]). Nothing is decoded. None for every other frame
+    /// encoder's check ([`SampleCopy::check`]). Nothing is decoded. A sample larger than the bytes
+    /// the export's batches budget for a rendered frame ([`crate::job::frame_bytes`]) is not read:
+    /// a copied frame holds no more memory than a rendered one. None for every other frame
     /// (rendered and encoded instead); why a candidate was not copied goes to the debug log.
     pub fn copied_sample(&self, f: i64, sources: &dyn SourceProvider, copy: &SampleCopy) -> Option<Vec<u8>> {
         if !self.passthrough {
@@ -346,7 +348,8 @@ impl Pipeline {
         if !crate::smart::same_rate(src_rate, self.rate) {
             return refuse(&format!("source at {src_rate:?}, export at {:?}", self.rate));
         }
-        let sample = match src.compressed_video_sample(found.time) {
+        let cap = crate::job::frame_bytes(self.w, self.h, self.hdr_out);
+        let sample = match src.compressed_video_sample(found.time, cap) {
             Ok(Some(s)) => s,
             Ok(None) => return refuse("the source has no intra-only samples to hand out"),
             Err(e) => return refuse(&format!("reading the sample: {e}")),

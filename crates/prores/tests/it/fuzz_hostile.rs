@@ -62,7 +62,8 @@ fn hostile_frames_never_panic() {
 }
 
 /// `check_frame` accepts every seed frame, with the header `probe` reads, and refuses it one byte
-/// short, one byte longer, or with a frame size past the sample.
+/// short, one byte longer, with a frame size past the sample, or with bytes no slice covers inside
+/// its picture or after it (sizes grown to match), which still decodes to the same frame.
 #[test]
 fn check_frame_takes_whole_frames_only() {
     for (si, seed) in seeds().iter().enumerate() {
@@ -76,6 +77,21 @@ fn check_frame_takes_whole_frames_only() {
         let mut lying = seed.clone();
         lying[0..4].copy_from_slice(&(seed.len() as u32 + 1).to_be_bytes());
         assert!(check_frame(&lying).is_err(), "seed {si}: frame size past the sample");
+        // padding after the picture's slices (picture and frame size grown), or after the picture
+        // (frame size grown): consistent sizes, still decodable, but not what the frame codes
+        let off = 8 + usize::from(u16::from_be_bytes([seed[8], seed[9]]));
+        let pic = u32::from_be_bytes([seed[off + 1], seed[off + 2], seed[off + 3], seed[off + 4]]) as usize;
+        let mut inside = seed.clone();
+        inside.splice(off + pic..off + pic, [0u8; 1000]);
+        inside[off + 1..off + 5].copy_from_slice(&((pic + 1000) as u32).to_be_bytes());
+        let mut after = seed.clone();
+        after.extend([0u8; 1000]);
+        for (name, mut padded) in [("inside the picture", inside), ("after the picture", after)] {
+            let size = padded.len() as u32;
+            padded[0..4].copy_from_slice(&size.to_be_bytes());
+            assert!(check_frame(&padded).is_err(), "seed {si}: padding {name}");
+            assert_eq!(decode_frame(&padded).unwrap(), decode_frame(seed).unwrap(), "seed {si}: padding {name} decodes differently");
+        }
     }
 }
 

@@ -491,8 +491,9 @@ impl MediaSource for Mp4Source {
 
     /// The ProRes or DNx sample `video_frame` decodes for `time` (same rounding and lookup), with the
     /// sample description's size and pixel aspect and the colour the frame decodes with. None for
-    /// other codecs and for a track whose frames are cropped or rotated.
-    fn compressed_video_sample(&self, time: Tick) -> Result<Option<CompressedSample>, MediaError> {
+    /// other codecs and for a track whose frames are cropped or rotated; an error, before reading,
+    /// for a sample over `max_bytes` in the sample table.
+    fn compressed_video_sample(&self, time: Tick, max_bytes: u64) -> Result<Option<CompressedSample>, MediaError> {
         let Some(ti) = self.vtrack.filter(|_| !self.display_transform) else { return Ok(None) };
         let Some(track) = self.file.tracks.get(ti) else { return Ok(None) };
         let Some(entry) = track.entries.first() else { return Ok(None) };
@@ -506,10 +507,8 @@ impl MediaSource for Mp4Source {
         let ts = i64::from(track.timescale.max(1));
         let target = time.max(Tick::ZERO).to_rational_round(1, ts).max(0);
         let Some(i) = track.sample_at_presentation_time(target).or_else(|| track.samples.len().checked_sub(1)) else { return Ok(None) };
-        let size = track.samples.get(i).map_or(0, |s| u64::from(s.size));
-        if size > filmcraft_media::MAX_COMPRESSED_SAMPLE {
-            return Err(MediaError::Unsupported(format!("video sample {i} is {size} bytes")));
-        }
+        let Some(sample) = track.samples.get(i) else { return Ok(None) };
+        crate::video::intra_sample_fits(i, u64::from(sample.size), max_bytes)?;
         let data = self.read(ti, i)?;
         let vp = entry.video.as_ref();
         let width = vp.map(|v| u32::from(v.width)).filter(|&w| w > 0).unwrap_or(track.width);
