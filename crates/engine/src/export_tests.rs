@@ -440,6 +440,8 @@ fn queue(s: &mut Session) -> Vec<Value> {
     s.execute("export.queue.list", json!({})).unwrap()["items"].as_array().unwrap().clone()
 }
 
+/// The export queue runs its items in the order they were moved to, skips one cancelled before
+/// it starts, retries it on request and clears the finished ones.
 #[test]
 fn queue_orders_cancels_and_retries() {
     let mut s = demo();
@@ -482,6 +484,8 @@ fn queue_orders_cancels_and_retries() {
     assert!(queue(&mut s).is_empty());
 }
 
+/// Moving a queue item by `i64::MAX` or `i64::MIN` places it last or first instead of
+/// overflowing.
 #[test]
 fn queue_move_by_extreme_offsets_clamps_instead_of_overflowing() {
     let mut s = demo();
@@ -498,6 +502,8 @@ fn queue_move_by_extreme_offsets_clamps_instead_of_overflowing() {
     assert_eq!(order(&mut s), [ids[1], ids[0], ids[2]]);
 }
 
+/// A queue item cancelled while it encodes ends as cancelled; one that fails (its directory
+/// cannot be created) shows the I/O error, is ready again after a retry and can be removed.
 #[test]
 fn queue_cancels_a_running_export_and_retries_a_failed_one() {
     let mut s = demo();
