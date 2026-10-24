@@ -3,7 +3,8 @@
 //! apply the Export effects (image, name and timecode overlays, video limiter) and convert to the
 //! encoder's input (straight sRGB RGBA8, or encoded R'G'B' floats for HDR).
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use filmcraft_geom::Vec2;
 use filmcraft_project::{ItemId, Project};
@@ -135,6 +136,9 @@ pub(crate) struct Pipeline {
     /// sequence's own size): an untouched frame can go to the encoder as decoded
     /// ([`Pipeline::untouched_yuv420`]).
     passthrough: bool,
+    /// Media items whose decoded frames [`yuv420_of`] refused (another sampling, matrix, range or
+    /// size: a property of the source): their frames are rendered without trying them again.
+    not_yuv420: RwLock<HashSet<ItemId>>,
     start_tc: i64,
     drop_frame: bool,
     /// Free the pool's float images when the export ends: a standalone export, not one part of a
@@ -236,6 +240,7 @@ impl Pipeline {
             effects,
             overlay,
             passthrough,
+            not_yuv420: RwLock::default(),
         })
     }
 
@@ -301,13 +306,24 @@ impl Pipeline {
     /// Output frame `f` as the 8-bit 4:2:0 BT.709 planes it was decoded with, when nothing is drawn
     /// on it ([`filmcraft_render::plan::untouched_frame`]) and this export changes nothing about it:
     /// [`Pipeline::frame`] and the encoder's conversion would only turn it into linear light and
-    /// back to (nearly, give or take a code) the same samples. None for every other frame.
+    /// back to (nearly, give or take a code) the same samples. None for every other frame. A source
+    /// whose decoded frame does not qualify is remembered and not decoded here again: its frames
+    /// would be planned and decoded twice, here and by the renderer.
     pub fn untouched_yuv420(&self, f: i64, sources: &dyn SourceProvider) -> Option<Yuv420> {
         if !self.passthrough {
             return None;
         }
-        let frame = filmcraft_render::plan::untouched_frame(&self.project, self.seq, self.rate.tick_of(f), self.opts, sources)?;
-        yuv420_of(&frame, self.w, self.h)
+        let t = self.rate.tick_of(f);
+        let item = filmcraft_render::plan::untouched_source(&self.project, self.seq, t, self.opts)?;
+        if self.not_yuv420.read().unwrap_or_else(PoisonError::into_inner).contains(&item) {
+            return None;
+        }
+        let frame = filmcraft_render::plan::untouched_frame(&self.project, self.seq, t, self.opts, sources)?;
+        let planes = yuv420_of(&frame, self.w, self.h);
+        if planes.is_none() {
+            self.not_yuv420.write().unwrap_or_else(PoisonError::into_inner).insert(item);
+        }
+        planes
     }
 
     /// Fit the rendered picture into the output frame.

@@ -258,3 +258,49 @@ fn untouched_and_rendered_frames_mix_into_the_same_file_on_any_core_count() {
     let red = |f: &(Vec<u8>, Vec<u8>, Vec<u8>)| f.2.iter().all(|&v| v > 200);
     assert!(frames[..12].iter().all(|f| !red(f)) && frames[12..].iter().all(red));
 }
+
+/// A source that counts the frames asked of it.
+struct Counting {
+    inner: Arc<dyn MediaSource>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MediaSource for Counting {
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.video_frame(req)
+    }
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+        self.inner.audio(start, frames, sample_rate)
+    }
+}
+
+/// A source whose decoded frames cannot go to the encoder as they are (BT.601, 4:2:2) is decoded
+/// once to find that out: every later frame of it is only decoded by the renderer, not twice.
+#[test]
+fn a_source_that_does_not_qualify_is_decoded_once_per_frame() {
+    for (name, color, chroma) in [("601", ColorInfo { matrix: Matrix::Bt601, ..ColorInfo::REC709 }, Chroma::C420), ("422", ColorInfo::REC709, Chroma::C422)] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let (p, seq, m) = camera_project(color, chroma, false, move |_, _, m| {
+            for source in m.0.values_mut() {
+                *source = Arc::new(Counting { inner: source.clone(), calls: counter.clone() });
+            }
+        });
+        let s = h264(&format!("count-{name}.mp4"));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        pool.install(|| {
+            let prog = Progress::default();
+            let mut ex = Exporter::new(p, seq, &s, &prog).unwrap();
+            ex.set_batch(1);
+            ex.set_overlap(false);
+            ex.set_untouched(true);
+            while !matches!(ex.step(&m, &prog).unwrap(), Step::Done(_)) {}
+        });
+        // 24 frames rendered, and the first one also decoded to look at its samples
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 24 + 1, "{name}: frames asked of the source");
+    }
+}

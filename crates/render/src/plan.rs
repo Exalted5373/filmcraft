@@ -270,9 +270,40 @@ pub fn is_cpu_frame(project: &Project, seq_id: ItemId, t: Tick) -> bool {
 /// The renderer would only turn such a frame into linear light and back. A caller that wants the
 /// picture in the frame's own Y'CbCr (an exporter whose encoder takes it) can use the decoded
 /// samples instead. The timeline is checked before anything is planned, so frames that are
-/// composited are not decoded or planned twice.
+/// composited are not decoded or planned twice; [`untouched_source`] is that check alone.
 pub fn untouched_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Option<Arc<VideoFrame>> {
     let seq = project.sequence(seq_id)?;
+    sole_plain_clip(project, seq, t, opts)?;
+    let FramePlan::Layers { width, height, layers } = plan_frame(project, seq_id, t, opts, sources) else {
+        return None;
+    };
+    let [layer] = layers.as_slice() else {
+        return None;
+    };
+    let decoded = !matches!(layer.frame.data, filmcraft_frame::PixelData::RgbaF32(_));
+    let size = (layer.frame.width as usize, layer.frame.height as usize);
+    (decoded
+        && layer.fx.is_none()
+        && layer.input.is_none()
+        && layer.blend == Blend::Normal
+        && layer.opacity >= 1.0
+        && near_identity(&layer.matrix)
+        && size == (width, height))
+        .then(|| layer.frame.clone())
+}
+
+/// The media item [`untouched_frame`] would decode for the frame of `seq_id` at `t`, from the
+/// timeline alone (nothing is planned or decoded). None where [`untouched_frame`] returns None
+/// without planning. A caller that learnt a source never decodes to frames it can use skips it.
+pub fn untouched_source(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions) -> Option<ItemId> {
+    let seq = project.sequence(seq_id)?;
+    sole_plain_clip(project, seq, t, opts).map(|clip| clip.item)
+}
+
+/// The one visible media clip of `seq` at `t` with no standard effect, opacity mask or transition
+/// and nothing over it (no other clip, no burned-in caption), at full render scale in a frame that
+/// plans as layers: the timeline conditions of [`untouched_frame`] and [`untouched_source`].
+fn sole_plain_clip<'a>(project: &Project, seq: &'a Sequence, t: Tick, opts: RenderOptions) -> Option<&'a TrackItem> {
     if opts.scale != 1.0 || whole_frame_on_cpu(project, seq, t) {
         return None;
     }
@@ -295,22 +326,7 @@ pub fn untouched_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderO
     if !media || (opts.effects && item.has_standard_effects()) || item.has_opacity_masks() {
         return None;
     }
-    let FramePlan::Layers { width, height, layers } = plan_frame(project, seq_id, t, opts, sources) else {
-        return None;
-    };
-    let [layer] = layers.as_slice() else {
-        return None;
-    };
-    let decoded = !matches!(layer.frame.data, filmcraft_frame::PixelData::RgbaF32(_));
-    let size = (layer.frame.width as usize, layer.frame.height as usize);
-    (decoded
-        && layer.fx.is_none()
-        && layer.input.is_none()
-        && layer.blend == Blend::Normal
-        && layer.opacity >= 1.0
-        && near_identity(&layer.matrix)
-        && size == (width, height))
-        .then(|| layer.frame.clone())
+    Some(item)
 }
 
 /// The frames [`plan_frame`] does not plan: an HDR / wide-gamut sequence composites and converts
