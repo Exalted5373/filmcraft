@@ -92,6 +92,12 @@ pub(crate) struct Gops {
     /// the one it is coding, as a GOP busy with a long batch would.
     #[cfg(test)]
     plant_hold: bool,
+    /// Make every GOP thread wait this long before it codes, as GOPs falling behind the input do.
+    #[cfg(test)]
+    plant_slow: std::time::Duration,
+    /// The most padded pictures held after a batch was scheduled.
+    #[cfg(test)]
+    peak: usize,
     /// GOP threads started and not ended yet.
     #[cfg(test)]
     live: Arc<AtomicUsize>,
@@ -104,6 +110,8 @@ struct Plant {
     panic: bool,
     /// See [`Gops::plant_hold`].
     hold: bool,
+    /// See [`Gops::plant_slow`].
+    slow: std::time::Duration,
     /// Counts the thread in [`Gops::live`] until it ends.
     alive: Alive,
 }
@@ -184,9 +192,11 @@ impl Gop {
         let (c, count, stop) = (Arc::clone(ctx), Arc::clone(&coded), Arc::clone(cancel));
         let body = move || -> Result<Refs, String> {
             #[cfg(test)]
-            let Plant { panic: plant_panic, hold, alive: _alive } = plant;
+            let Plant { panic: plant_panic, hold, slow, alive: _alive } = plant;
             let refs = refs_rx.recv().map_err(|_| "the GOP never reached its thread".to_string())?;
             catch_unwind(AssertUnwindSafe(|| {
+                #[cfg(test)]
+                std::thread::sleep(slow);
                 #[cfg(test)]
                 if hold {
                     while !stop.load(Ordering::Relaxed) {
@@ -399,6 +409,10 @@ impl Gops {
             #[cfg(test)]
             plant_hold: false,
             #[cfg(test)]
+            plant_slow: std::time::Duration::ZERO,
+            #[cfg(test)]
+            peak: 0,
+            #[cfg(test)]
             live: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -460,8 +474,16 @@ impl Encoder {
     /// Before an input picture: take coded pictures of the oldest GOP (waiting for them) while one
     /// more picture would pass the budget.
     pub(crate) fn gop_make_room(&mut self) {
+        self.gop_room(1, 0);
+    }
+
+    /// Take coded pictures of the oldest GOPs (waiting for them) until `inputs` input pictures
+    /// besides the pending ones and `extra` more padded pictures fit in the budget, or no GOP is
+    /// left to take. Two GOPs of `keyint` pictures fit (or the encoder is serial), so with every
+    /// GOP taken a new one always fits.
+    fn gop_room(&mut self, inputs: usize, extra: usize) {
         while let Some(g) = self.gops.as_ref()
-            && g.frames_held(self.pending.len() + 1) > g.budget
+            && g.frames_held(self.pending.len().saturating_add(inputs)).saturating_add(extra) > g.budget
         {
             if !self.gop_take_front(true) {
                 break;
@@ -511,6 +533,10 @@ impl Encoder {
                     break;
                 }
             }
+            // the new GOP's working set must fit in the budget too, with the pictures of the batch
+            // and the one picture a call may hold aside while it schedules the others
+            let work = self.gops.as_ref().map_or(0, |g| g.work);
+            self.gop_room(batch.pics.len().saturating_add(1), work);
             let Some(g) = self.gops.as_mut() else { return };
             if !idr && g.restart {
                 return;
@@ -526,7 +552,7 @@ impl Encoder {
                 self.refs.take_state()
             };
             #[cfg(test)]
-            let plant = Plant { panic: g.plant_panic == Some(g.next_seq), hold: g.plant_hold, alive: Alive::new(&g.live) };
+            let plant = Plant { panic: g.plant_panic == Some(g.next_seq), hold: g.plant_hold, slow: g.plant_slow, alive: Alive::new(&g.live) };
             g.next_seq += 1;
             let gop = Gop::start(
                 &self.ctx,
@@ -550,6 +576,10 @@ impl Encoder {
         let fixed = g.fixed;
         if let Some(open) = g.open() {
             open.send(&self.ctx, fixed, batch);
+        }
+        #[cfg(test)]
+        {
+            g.peak = g.peak.max(g.frames_held(self.pending.len()));
         }
         self.gop_check();
     }
@@ -850,5 +880,40 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), gops);
         drop(enc);
         assert_eq!(live.load(Ordering::SeqCst), 0, "GOP threads left after the drop");
+    }
+
+    /// With GOPs falling behind the input and a budget just above the smallest the GOP-parallel
+    /// path accepts, starting a GOP waits for room for its working set: the pictures held never
+    /// pass the budget, and the stream is still the serial one.
+    #[test]
+    fn starting_a_gop_keeps_the_pictures_held_within_the_budget() {
+        let mut enc = encoder(4, None);
+        let budget = {
+            let g = enc.gops.as_mut().unwrap();
+            // two GOPs of `keyint` pictures with their working sets, and the spares (the least
+            // `Gops::new` accepts), and 5 more: two GOPs fit while a third one is due
+            g.budget = 2 * (4 + g.work) + super::SPARE_FRAMES + 5;
+            g.plant_slow = std::time::Duration::from_millis(10);
+            g.budget
+        };
+        let mut packets = Vec::new();
+        for t in 0..24 {
+            let [y, u, v] = picture(64, 48, t);
+            packets.extend(enc.try_encode(&YuvFrame { y: &y, u: &u, v: &v, y_stride: 64, uv_stride: 32 }, t as i64).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+        let peak = enc.gops.as_ref().unwrap().peak;
+        assert!(peak <= budget, "{peak} padded pictures held, budget {budget}");
+        let serial = {
+            let mut c = EncoderConfig::new(64, 48, 10, 1);
+            c.keyint = 4;
+            c.threads = 3;
+            c.parallel_gops = false;
+            run(Encoder::new(c).unwrap(), &[Step::Encode(24), Step::Flush])
+        };
+        assert_eq!(packets.len(), serial.packets.len());
+        for (a, b) in packets.iter().zip(&serial.packets) {
+            assert!(a.data == b.data && (a.pts, a.dts) == (b.pts, b.dts), "picture {}", a.pts);
+        }
     }
 }

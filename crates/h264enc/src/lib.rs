@@ -863,8 +863,10 @@ impl Encoder {
     /// before it as B pictures, together in one batch.
     fn flush_minigop(&mut self) {
         let Some(p) = self.pending.pop_back() else { return };
-        let bs: Vec<(Input, SliceType, bool)> = self.pending.drain(..).map(|b| (b, SliceType::B, false)).collect();
+        // the B pictures stay pending (and counted in the GOP-parallel picture budget) until the
+        // P picture is scheduled
         self.schedule(vec![(p, SliceType::P, false)]);
+        let bs: Vec<(Input, SliceType, bool)> = self.pending.drain(..).map(|b| (b, SliceType::B, false)).collect();
         if !bs.is_empty() {
             // B-frames are non-reference pictures: encode them all concurrently.
             self.schedule(bs);

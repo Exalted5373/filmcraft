@@ -85,8 +85,9 @@ With the `threads` feature (on by default) the encoder has its own rayon pool of
 
   Memory: the input pictures not coded yet plus each GOP thread's working set (references with their
   half-sample planes, reconstructions) stay within 1 GiB of padded pictures; `try_encode` waits for the
-  oldest GOP when the next picture would pass it. When two GOPs of `keyint` pictures do not fit (1080p
-  with `keyint` 250, 4K with a 2-second `keyint`), or with one thread, the encoder stays serial. A GOP
+  oldest GOPs when the next picture, or the working set of a GOP about to start, would pass it. When two
+  GOPs of `keyint` pictures do not fit (1080p with `keyint` 250, 4K with a 2-second `keyint`), or with one
+  thread, the encoder stays serial (so with the older GOPs taken a new one always fits). A GOP
   thread that panics turns into `Error::Worker`, returned by the first `try_encode` / `flush` after its
   death is noticed: that GOP's remaining packets are lost, it takes no more pictures, and when the stream
   would have continued from it the next picture is coded as an IDR, so no later picture refers to a lost
