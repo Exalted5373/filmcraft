@@ -27,12 +27,14 @@ fn reference(px: &dyn Fn(usize) -> (f32, f32, f32), w: usize, h: usize, kr: f32,
     (y, u, v)
 }
 
+/// [`rgba_to_yuv420_8`]'s three planes for an RGBA8 picture.
 fn rgba(px: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
     rgba_to_yuv420_8(px, w, h, &mut y, &mut u, &mut v);
     (y, u, v)
 }
 
+/// `n` pseudo-random numbers from `seed` (xorshift), the same on every run.
 fn noise(n: usize, seed: u64) -> impl Iterator<Item = u64> {
     let mut s = seed | 1;
     std::iter::repeat_with(move || {
@@ -44,6 +46,7 @@ fn noise(n: usize, seed: u64) -> impl Iterator<Item = u64> {
     .take(n)
 }
 
+/// Black, white and the three primaries give the BT.709 limited-range codes.
 #[test]
 fn primaries_have_the_bt709_limited_range_codes() {
     for (px, want) in [
@@ -59,6 +62,8 @@ fn primaries_have_the_bt709_limited_range_codes() {
     }
 }
 
+/// RGBA8 pictures, noise and pure black/white, give the reference codes on odd sizes, around the
+/// 64-pixel blocks and in full HD.
 #[test]
 fn rgba_codes_follow_the_formula_on_every_size() {
     // odd sizes, sizes around the converter's 64-pixel blocks, and a full HD picture
@@ -71,6 +76,8 @@ fn rgba_codes_follow_the_formula_on_every_size() {
     }
 }
 
+/// Float pictures with NaN, infinities, negative, out-of-range and subnormal values give the
+/// reference codes (BT.2020 matrix).
 #[test]
 fn float_codes_follow_the_formula_with_hostile_values() {
     let specials = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0, -1.0, 2.0, 0.5, 1e-40, 0.499_999_97];
@@ -85,6 +92,8 @@ fn float_codes_follow_the_formula_with_hostile_values() {
     }
 }
 
+/// A picture shorter than its size converts its rows and leaves the rest black, and an empty one
+/// gives empty planes.
 #[test]
 fn a_short_picture_converts_without_panicking() {
     // two of four rows: the rows it has keep their colour, the missing ones come out black
@@ -99,6 +108,8 @@ fn a_short_picture_converts_without_panicking() {
     assert_eq!(rgba(&[], 0, 0), (vec![], vec![], vec![]));
 }
 
+/// The H.264 encoder returns an error naming the picture it got for a short RGBA or HDR picture, and
+/// for a whole picture of another size; one of its own size encodes.
 #[test]
 fn the_h264_encoder_refuses_a_picture_of_the_wrong_size() {
     let settings = ExportSettings::default();

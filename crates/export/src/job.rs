@@ -239,6 +239,8 @@ impl Exporter {
         timed(Stage::Setup, || Self::set_up(project, seq, settings, progress))
     }
 
+    /// [`Exporter::new`]'s work: checks the settings, derives the output colour, bitrate and frame
+    /// range, and opens the video and audio encoders.
     fn set_up(project: Arc<Project>, seq: ItemId, settings: &ExportSettings, progress: &Progress) -> Result<Self> {
         if !stepped(settings.format) {
             return Err(ExportError::Unsupported(format!("{} is not a stepped export", settings.format.label())));
@@ -664,6 +666,8 @@ impl Exporter {
         Ok(Encoded::Done)
     }
 
+    /// Encodes frame `f`: 4:2:0 planes converted while rendering go to the encoder as they are, an
+    /// RGBA (or HDR float) picture is converted by the encoder.
     fn encode(&mut self, frame: &Frame, f: i64) -> Result<Vec<EncodedPacket>> {
         let index = (f - self.f0) as u64;
         match frame {

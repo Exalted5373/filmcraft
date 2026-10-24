@@ -46,6 +46,8 @@ fn same_file_whatever_the_core_count() {
     }
 }
 
+/// An export adds time to the counter of every stage it goes through; H.264 converts to 4:2:0 while
+/// rendering and ProRes in its encoder (convert stage).
 #[test]
 fn an_export_adds_up_the_wall_time_of_its_stages() {
     let export_stages = |format: Format, ext: &str, stages: &[Stage]| {
@@ -212,6 +214,8 @@ fn hdr_with_audio_is_the_same_file_when_the_memory_budget_caps_the_batch() {
     }
 }
 
+/// SDR, two-pass and PQ H.264 exports are the same file whether the pictures are converted to 4:2:0
+/// on the render threads or by the encoder, rendered ahead or not.
 #[test]
 fn converting_while_rendering_does_not_change_the_file() {
     use filmcraft_color::{ColorPipeline, WorkingSpace};

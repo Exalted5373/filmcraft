@@ -1585,6 +1585,7 @@ impl VideoEncoder for H264Encoder {
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
+    /// Checks the picture's size against the encoder's, converts it to 4:2:0 and encodes it.
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         let (w, h) = (f.width as usize, f.height as usize);
         let (want, got) = match f.hdr {
@@ -1600,9 +1601,11 @@ impl VideoEncoder for H264Encoder {
         self.yuv = yuv;
         packets
     }
+    /// The conversion of [`H264Encoder::input`], run by the exporter while rendering.
     fn yuv420_input(&self) -> Option<Yuv420Input> {
         Some(self.input())
     }
+    /// Encodes 4:2:0 planes at the encoder's size as picture `index`.
     fn encode_yuv420(&mut self, picture: &Yuv420, index: u64) -> Result<Vec<EncodedPacket>> {
         let (w, cw) = (self.w as usize, (self.w as usize).div_ceil(2));
         let frame = filmcraft_h264enc::YuvFrame { y: &picture.y, u: &picture.u, v: &picture.v, y_stride: w, uv_stride: cw };
@@ -1785,6 +1788,9 @@ pub(crate) fn h264_slices(height: u32) -> usize {
     (height.div_ceil(16) as usize).div_ceil(4).max(1)
 }
 
+/// The built-in H.264 encoder for an H.264 export (`None` for any other format), configured from the
+/// settings: packet format, keyframe distance, slices, rate control, pass, profile, level, pixel
+/// aspect and HDR signalling.
 fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
     if format != Format::H264 {
         return None;
