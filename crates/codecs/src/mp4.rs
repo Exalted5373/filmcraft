@@ -516,7 +516,7 @@ impl MediaSource for Mp4Source {
             fourcc: entry.format.0,
             width,
             height,
-            container_color: self.explicit_color,
+            color: self.explicit_color.or_else(|| crate::video::intra_sample_color(codec, &data)),
             par: vp.and_then(|v| v.pixel_aspect).unwrap_or((1, 1)),
             index: i,
             data,

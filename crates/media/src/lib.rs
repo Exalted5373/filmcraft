@@ -177,9 +177,10 @@ pub struct CompressedSample {
     /// Coded picture size the container gives.
     pub width: u32,
     pub height: u32,
-    /// The colour the container signals, which overrides the frame header's when the source decodes
-    /// the sample (None: the frame header's colour applies).
-    pub container_color: Option<ColorInfo>,
+    /// The colour [`MediaSource::video_frame`] gives the decoded picture of this sample: the
+    /// container's when it signals one (it overrides the frame header's), else what the source's
+    /// decoder reads from the frame header. None when the frame header does not parse.
+    pub color: Option<ColorInfo>,
     /// Pixel aspect ratio the container signals.
     pub par: (u32, u32),
     /// Index of the sample in its track (in stored order).

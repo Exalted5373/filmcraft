@@ -37,14 +37,19 @@ fn fill(n: usize, y: &mut [u16], cb: &mut [u16], cr: &mut [u16], w: usize) {
 
 /// `n` ProRes frames of `profile` (alpha coded when `alpha`), the frame headers saying `color`.
 fn prores_samples(profile: filmcraft_prores::Profile, n: usize, alpha: bool, color: filmcraft_prores::ColorInfo) -> Vec<Vec<u8>> {
-    let mut cfg = filmcraft_prores::EncoderConfig::new(profile, W, H);
+    prores_samples_sized(profile, W, H, n, alpha, color)
+}
+
+/// [`prores_samples`] of `w` x `h`.
+fn prores_samples_sized(profile: filmcraft_prores::Profile, w: u32, h: u32, n: usize, alpha: bool, color: filmcraft_prores::ColorInfo) -> Vec<Vec<u8>> {
+    let mut cfg = filmcraft_prores::EncoderConfig::new(profile, w, h);
     cfg.color = color;
     cfg.encode_alpha = alpha;
     let mut enc = filmcraft_prores::Encoder::with_config(cfg);
     (0..n)
         .map(|k| {
-            let mut f = filmcraft_prores::Frame::new(W, H, profile.chroma(), 10, alpha);
-            fill(k, &mut f.y, &mut f.cb, &mut f.cr, W as usize);
+            let mut f = filmcraft_prores::Frame::new(w, h, profile.chroma(), 10, alpha);
+            fill(k, &mut f.y, &mut f.cb, &mut f.cr, w as usize);
             if let Some(a) = f.alpha.as_mut() {
                 a.iter_mut().enumerate().for_each(|(i, v)| *v = (i % 1024) as u16);
             }
@@ -70,6 +75,11 @@ fn mov(name: &str, mut entry: SampleEntry, rate: FrameRate, samples: &[Vec<u8>])
     if entry.video.as_ref().is_some_and(|v| v.color.is_none()) {
         ColorSignal::default().apply_to(&mut entry, true);
     }
+    unlabelled_mov(name, entry, rate, samples)
+}
+
+/// A MOV of `samples` at `rate` described by `entry` as it is (no `colr` box unless it has one).
+fn unlabelled_mov(name: &str, entry: SampleEntry, rate: FrameRate, samples: &[Vec<u8>]) -> (String, SharedSource) {
     let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
     let track = mux.add_track(TrackConfig::new(entry, rate.num as u32)).unwrap();
     for s in samples {
@@ -423,7 +433,7 @@ fn the_sample_check_survives_hostile_bytes() {
         fourcc: *fourcc,
         width: W,
         height: H,
-        container_color: None,
+        color: Some(filmcraft_color::ColorInfo::REC709),
         par: (1, 1),
         index: 0,
         data,
@@ -504,4 +514,65 @@ fn an_mxf_source_copies_too() {
     assert_eq!(copied, N as u64);
     let (out, _, _, _) = video_samples(&bytes);
     assert!(out == wanted, "the MXF's samples");
+}
+
+/// A sample is copied when the colour the source decodes it with is BT.709, whatever the frame
+/// size: without a container colour the ProRes and DNx decoders give BT.709 for unspecified codes
+/// at any size (no SD default), so an SD source without colour is copied, as an HD one is. A
+/// BT.601 frame header, or a `colr` box that leaves the matrix unspecified (resolved by size:
+/// BT.601 for SD), decodes as BT.601 and is rendered. The check agrees with the decoded frame in
+/// every case.
+#[test]
+fn the_colour_the_source_decodes_with_decides_a_copy() {
+    use filmcraft_color::{ColorInfo, Matrix};
+    use filmcraft_prores::{ColorInfo as Codes, Profile};
+    let none = |_: &mut Project, _: ItemId, _: ItemId, _: &mut SourceMap| {};
+    let unspecified = Codes { primaries: 2, transfer: 2, matrix: 2 };
+    let colr_unspecified = Some(filmcraft_isobmff::ColorInfo::Nclc { primaries: 2, transfer: 2, matrix: 2 });
+    let entry = |w: u32, h: u32, colr: Option<filmcraft_isobmff::ColorInfo>| {
+        let mut e = SampleEntry::prores(FourCc(Profile::Hq.fourcc()), w as u16, h as u16);
+        e.video.as_mut().unwrap().color = colr;
+        e
+    };
+    let bt601 = ColorInfo { matrix: Matrix::Bt601, ..ColorInfo::REC709 };
+    // (case, size, container colour, frame header codes, the colour the source decodes with)
+    let cases = [
+        ("SD without colour", (W, H), None, unspecified, ColorInfo::REC709),
+        ("SD, header codes 0", (W, H), None, Codes { primaries: 0, transfer: 0, matrix: 0 }, ColorInfo::REC709),
+        ("SD, BT.709 header", (W, H), None, Codes { primaries: 1, transfer: 1, matrix: 1 }, ColorInfo::REC709),
+        ("HD without colour", (1280, 720), None, unspecified, ColorInfo::REC709),
+        ("SD, BT.601 header", (W, H), None, Codes { primaries: 1, transfer: 1, matrix: 6 }, bt601),
+        ("SD, colr without a matrix", (W, H), colr_unspecified.clone(), unspecified, bt601),
+    ];
+    for (k, (name, (w, h), colr, codes, want)) in cases.into_iter().enumerate() {
+        let samples = prores_samples_sized(Profile::Hq, w, h, 1, false, codes);
+        let (_, src) = unlabelled_mov(&format!("colour-{k}.mov"), entry(w, h, colr), RATE, &samples);
+        let sample = src.compressed_video_sample(Tick::ZERO).unwrap().unwrap();
+        let decoded = src.video_frame(FrameRequest::full(Tick::ZERO)).unwrap().color;
+        let copy =
+            SampleCopy { flavour: CopyFlavour::ProRes { profile: Profile::Hq, alpha: false }, width: w, height: h, rate: RATE, signal: ColorSignal::default() };
+        let checked = copy.check(&sample);
+        assert_eq!(checked.is_ok(), decoded == ColorInfo::REC709, "{name}: the check ({checked:?}) disagrees with the decoded {decoded:?}");
+        assert_eq!((sample.color, decoded), (Some(want), want), "{name}");
+    }
+    // DNxHR without colour decodes as BT.709 too
+    let dnx = dnx_samples(filmcraft_dnx::Profile::Hq, 1);
+    let (_, src) = unlabelled_mov("colour-dnx.mov", SampleEntry::dnx(FourCc(*b"AVdh"), W as u16, H as u16), RATE, &dnx);
+    let sample = src.compressed_video_sample(Tick::ZERO).unwrap().unwrap();
+    assert_eq!((sample.color, src.video_frame(FrameRequest::full(Tick::ZERO)).unwrap().color), (Some(ColorInfo::REC709), ColorInfo::REC709));
+    let dnx_copy = SampleCopy {
+        flavour: CopyFlavour::DnxHr { profile: filmcraft_dnx::Profile::Hq, bit_depth: 8 },
+        width: W,
+        height: H,
+        rate: RATE,
+        signal: ColorSignal::default(),
+    };
+    assert_eq!(dnx_copy.check(&sample), Ok(()));
+    // end to end: the SD source without colour is copied, the one whose `colr` leaves the matrix to
+    // the frame size is rendered
+    let samples = prores_samples(Profile::Hq, N, false, unspecified);
+    let (path, src) = unlabelled_mov("colour-sd.mov", entry(W, H, None), RATE, &samples);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("colour-sd-out.mov", "hq")), N as u64, "SD without colour");
+    let (path, src) = unlabelled_mov("colour-sd-colr.mov", entry(W, H, colr_unspecified), RATE, &samples);
+    assert_eq!(copies(&path, src, seq_settings(), none, &prores("colour-sd-colr-out.mov", "hq")), 0, "SD, colr without a matrix");
 }

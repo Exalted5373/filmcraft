@@ -81,7 +81,9 @@ impl SampleCopy {
     /// Whether `s` can be written unchanged as one of this encoder's packets: the same codec
     /// flavour, coded size, progressive scan, alpha, colour and square pixels, read from the
     /// container and checked in the frame header, whose sizes must also agree with the sample's.
-    /// Err says why not (for the debug log).
+    /// The colour the source decodes the sample with ([`CompressedSample::color`]) must be BT.709,
+    /// so a copy shows what rendering the frame would; the frame header's own codes must also
+    /// say BT.709 or nothing, for players that read them. Err says why not (for the debug log).
     pub fn check(&self, s: &CompressedSample) -> Result<(), String> {
         if self.signal != ColorSignal::default() {
             return Err("only BT.709 SDR exports take copies".into());
@@ -92,8 +94,8 @@ impl SampleCopy {
         if s.par.0 != s.par.1 || s.par.0 == 0 {
             return Err(format!("pixel aspect {}:{}", s.par.0, s.par.1));
         }
-        if s.container_color.is_some_and(|c| c != filmcraft_color::ColorInfo::REC709) {
-            return Err(format!("container colour {:?}", s.container_color));
+        if s.color != Some(filmcraft_color::ColorInfo::REC709) {
+            return Err(format!("decoded colour {:?}", s.color));
         }
         match self.flavour {
             CopyFlavour::ProRes { profile, alpha } => self.check_prores(s, profile, alpha),

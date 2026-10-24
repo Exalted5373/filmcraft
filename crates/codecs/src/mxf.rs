@@ -481,7 +481,8 @@ impl MediaSource for MxfSource {
             return Err(MediaError::Unsupported(format!("video sample {i} is {size} bytes")));
         }
         let data = self.file.read_sample(&self.bytes, ti, i).map_err(|e| MediaError::Io(e.to_string()))?;
-        Ok(Some(CompressedSample { codec, fourcc, width: v.width, height: v.height, container_color: self.explicit_color, par: v.par, index: i, data }))
+        let color = self.explicit_color.or_else(|| crate::video::intra_sample_color(codec, &data));
+        Ok(Some(CompressedSample { codec, fourcc, width: v.width, height: v.height, color, par: v.par, index: i, data }))
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {

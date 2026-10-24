@@ -763,13 +763,7 @@ impl VideoDecoder for ProResDecoder {
             filmcraft_prores::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
             filmcraft_prores::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
         };
-        let mut color = filmcraft_color::ColorInfo::REC709;
-        if let Some(m) = filmcraft_color::Matrix::from_code(f.color.matrix) {
-            color.matrix = m;
-        }
-        if let Some(t) = filmcraft_color::Transfer::from_code(f.color.transfer) {
-            color.transfer = t;
-        }
+        let color = prores_color(f.color);
         let frame = VideoFrame {
             width: f.width,
             height: f.height,
@@ -795,6 +789,20 @@ impl VideoDecoder for ProResDecoder {
     fn intra_only(&self) -> bool {
         true
     }
+}
+
+/// The colour [`ProResDecoder`] gives a frame whose header signals `codes`: BT.709, with the matrix
+/// and transfer of the header where it names one we know. Unspecified codes (0, 2) stay BT.709 at
+/// any frame size (no SD default), and the primaries are not read.
+pub fn prores_color(codes: filmcraft_prores::ColorInfo) -> filmcraft_color::ColorInfo {
+    let mut color = filmcraft_color::ColorInfo::REC709;
+    if let Some(m) = filmcraft_color::Matrix::from_code(codes.matrix) {
+        color.matrix = m;
+    }
+    if let Some(t) = filmcraft_color::Transfer::from_code(codes.transfer) {
+        color.transfer = t;
+    }
+    color
 }
 
 pub fn prores_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
@@ -879,11 +887,7 @@ pub fn dnx_to_video_frame(f: filmcraft_dnx::Frame) -> VideoFrame {
         filmcraft_dnx::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
         filmcraft_dnx::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
     };
-    let mut color = filmcraft_color::ColorInfo::REC709;
-    if matches!(f.color_volume, filmcraft_dnx::ColorVolume::Bt2020Ncl | filmcraft_dnx::ColorVolume::Bt2020Cl) {
-        color.matrix = filmcraft_color::Matrix::Bt2020Ncl;
-        color.primaries = filmcraft_color::Primaries::Bt2020;
-    }
+    let color = dnx_color(f.color_volume);
     let (mut y, mut cb, mut cr) = (f.y, f.cb, f.cr);
     if f.rgb {
         // planes hold G, B, R (video range); derive Y'CbCr with the stream's matrix
@@ -916,6 +920,27 @@ pub fn dnx_to_video_frame(f: filmcraft_dnx::Frame) -> VideoFrame {
         filmcraft_frame::PixelData::Yuv16 { planes: [Arc::new(y), Arc::new(cb), Arc::new(cr)], chroma, bits: f.bit_depth as u32, alpha: f.alpha.map(Arc::new) }
     };
     VideoFrame { width: f.width, height: f.height, data, color, par, pts: filmcraft_time::Tick::ZERO }
+}
+
+/// The colour [`dnx_to_video_frame`] gives a frame of colour volume `volume`: BT.2020 matrix and
+/// primaries for the BT.2020 volumes, BT.709 for every other (no default by frame size).
+pub fn dnx_color(volume: filmcraft_dnx::ColorVolume) -> filmcraft_color::ColorInfo {
+    let mut color = filmcraft_color::ColorInfo::REC709;
+    if matches!(volume, filmcraft_dnx::ColorVolume::Bt2020Ncl | filmcraft_dnx::ColorVolume::Bt2020Cl) {
+        color.matrix = filmcraft_color::Matrix::Bt2020Ncl;
+        color.primaries = filmcraft_color::Primaries::Bt2020;
+    }
+    color
+}
+
+/// The colour a source decodes the compressed `sample` of an intra-only `codec` with when its
+/// container signals none: what the decoder makes of the frame header ([`prores_color`],
+/// [`dnx_color`]). None when the header does not parse (the sample doesn't decode either).
+pub(crate) fn intra_sample_color(codec: filmcraft_media::IntraCodec, sample: &[u8]) -> Option<filmcraft_color::ColorInfo> {
+    match codec {
+        filmcraft_media::IntraCodec::ProRes => filmcraft_prores::probe(sample).ok().map(|h| prores_color(h.color)),
+        filmcraft_media::IntraCodec::Dnx => filmcraft_dnx::probe(sample).ok().map(|h| dnx_color(h.color_volume)),
+    }
 }
 
 impl VideoDecoder for DnxDecoder {
