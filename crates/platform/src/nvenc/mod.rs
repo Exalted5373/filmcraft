@@ -417,6 +417,9 @@ impl Nvenc {
         self.submit_picture(index, true, |l| fill_p010(l, y, u, v, w, h))
     }
 
+    /// Submits picture `index` to a free slot (reading out the oldest picture first when the ring is
+    /// full), filling its planar (NV12 / P010) or RGBA input buffer with `fill`. The pictures that
+    /// came out to free the slot.
     fn submit_picture(&mut self, index: u64, planar: bool, fill: impl FnOnce(Locked<'_>)) -> Result<Vec<Packet>, String> {
         let mut out = Vec::new();
         let slot = match self.free.pop() {

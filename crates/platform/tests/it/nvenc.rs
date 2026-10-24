@@ -105,6 +105,8 @@ fn the_stream_decodes_to_the_source() {
     eprintln!("worst luma PSNR {worst:.1} dB, {} bytes", packets.iter().map(|p| p.data.len()).sum::<usize>());
 }
 
+/// An RGBA-input session takes planar pictures between RGBA ones, B-frames included, and both
+/// decode back to their source.
 #[test]
 fn an_rgba_input_encoder_also_takes_planar_pictures() {
     let _one = crate::common::NVENC_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -108,6 +108,8 @@ impl VideoEncoder for NvencEncoder {
         u32::try_from(self.rate.num).unwrap_or(u32::MAX)
     }
 
+    /// Encodes a rendered picture: HDR floats converted to 10-bit for Main 10, RGBA converted by the
+    /// GPU on an RGBA-input session, or to 4:2:0 here otherwise.
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         if f.width != self.w || f.height != self.h {
             return Err(ExportError::Encode(format!("NVENC: a {}x{} picture for a {}x{} encoder", f.width, f.height, self.w, self.h)));
@@ -145,6 +147,7 @@ impl VideoEncoder for NvencEncoder {
         !self.enc.is_ten_bit()
     }
 
+    /// Encodes an untouched frame's decoded 4:2:0 planes through the NV12 input.
     fn encode_yuv420(&mut self, picture: &Yuv420, index: u64) -> Result<Vec<EncodedPacket>> {
         let hint = self.hint();
         let ps = self.enc.encode(&picture.y, &picture.u, &picture.v, index).map_err(|e| ExportError::Encode(format!("NVENC: {e}{hint}")))?;

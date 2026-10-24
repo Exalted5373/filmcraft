@@ -33,6 +33,7 @@ fn picture(n: usize, color: ColorInfo, chroma: Chroma, alpha: bool) -> VideoFram
     }
 }
 
+/// A camera clip decoding to [`picture`]s with the given colour, chroma sampling and alpha.
 struct Camera {
     info: MediaInfo,
     color: ColorInfo,
@@ -41,13 +42,16 @@ struct Camera {
 }
 
 impl MediaSource for Camera {
+    /// The generator's `W` x `H` stream at `RATE`.
     fn info(&self) -> &MediaInfo {
         &self.info
     }
+    /// The [`picture`] of the frame at the requested time.
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         let n = usize::try_from(RATE.frame_at(req.time)).unwrap_or(0);
         Ok(Arc::new(picture(n, self.color, self.chroma, self.alpha)))
     }
+    /// Stereo silence.
     fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
         Ok(AudioBuffer::silence(sample_rate, 2, frames))
     }
@@ -89,21 +93,26 @@ fn camera_project(color: ColorInfo, chroma: Chroma, alpha: bool, edit: impl FnOn
     (Arc::new(p), seq, m)
 }
 
+/// H.264 export settings without audio, writing `name` in the test directory.
 fn h264(name: &str) -> ExportSettings {
     ExportSettings { format: Format::H264, path: tmp(name), include_audio: false, ..Default::default() }
 }
 
+/// `name` in this process's scratch directory, created if needed.
 fn tmp(name: &str) -> String {
     let d = std::env::temp_dir().join(format!("fc-export-untouched-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d.join(name).to_string_lossy().to_string()
 }
 
+/// The three 8-bit planes of a decoded frame.
 fn planes(f: &VideoFrame) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let PixelData::Yuv8 { planes, .. } = &f.data else { panic!("not 8-bit Y'CbCr") };
     (planes[0].to_vec(), planes[1].to_vec(), planes[2].to_vec())
 }
 
+/// A plain clip's frames, BT.709 or sRGB transfer, reach the encoder as the planes they were decoded
+/// with.
 #[test]
 fn an_untouched_clip_reaches_the_encoder_as_it_was_decoded() {
     for color in [ColorInfo::REC709, ColorInfo { transfer: Transfer::Srgb, ..ColorInfo::REC709 }] {
@@ -121,6 +130,7 @@ fn clip(p: &mut Project, seq: ItemId) -> &mut filmcraft_project::TrackItem {
     &mut p.sequence_mut(seq).unwrap().video_tracks[0].items[0]
 }
 
+/// Sets a float parameter of an effect of the clip on V1.
 fn set(p: &mut Project, seq: ItemId, effect: &str, param: &str, value: f64) {
     clip(p, seq).effect_mut(effect).unwrap().param_mut(param).unwrap().value = ParamValue::Float(value);
 }
@@ -132,6 +142,7 @@ fn matte_above(p: &mut Project, seq: ItemId, m: &mut SourceMap) {
     p.sequence_mut(seq).unwrap().video_tracks[1].items.push(clip);
 }
 
+/// A subtitle caption over the whole clip.
 fn caption(p: &mut Project, seq: ItemId, _: &mut SourceMap) {
     let mut track = CaptionTrack::new(TrackId(p.alloc_id()), "Subtitle".into(), CaptionFormat::Subtitle);
     let id = ClipId(p.alloc_id());
@@ -147,6 +158,9 @@ fn caption(p: &mut Project, seq: ItemId, _: &mut SourceMap) {
     p.sequence_mut(seq).unwrap().caption_tracks.push(track);
 }
 
+/// Every edit that changes the picture (opacity, scale, an effect, a clip or caption above), every
+/// export setting that changes it (limiter, overlays, another size, HDR) and every decoded format
+/// the encoder would convert differently sends the frame through the renderer.
 #[test]
 fn anything_that_changes_the_picture_goes_through_the_renderer() {
     type Edit = fn(&mut Project, ItemId, &mut SourceMap);
@@ -230,6 +244,8 @@ fn export_and_decode(
     (bytes, frames)
 }
 
+/// Untouched frames encoded from their decoded samples come back closer to the source than the same
+/// frames rendered and converted again.
 #[test]
 fn untouched_footage_is_encoded_from_its_own_samples() {
     let (_, direct) = export_and_decode("direct.mp4", true, 3, 5, true, |_, _, _| {});
@@ -246,6 +262,8 @@ fn untouched_footage_is_encoded_from_its_own_samples() {
     assert!(direct_err / 24.0 < 0.5, "untouched frames came back {direct_err:.3} codes off");
 }
 
+/// An export mixing untouched and rendered frames is the same file on any core count and batch,
+/// with the matte drawn only where it is.
 #[test]
 fn untouched_and_rendered_frames_mix_into_the_same_file_on_any_core_count() {
     // frames 12..24 have a matte above (rendered); 0..12 are untouched
@@ -266,13 +284,16 @@ struct Counting {
 }
 
 impl MediaSource for Counting {
+    /// The wrapped source's.
     fn info(&self) -> &MediaInfo {
         self.inner.info()
     }
+    /// Counts the request and passes it on.
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.video_frame(req)
     }
+    /// The wrapped source's audio.
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
         self.inner.audio(start, frames, sample_rate)
     }

@@ -138,6 +138,7 @@ struct EncoderInput {
 }
 
 impl EncoderInput {
+    /// What `venc` takes: untouched frames as decoded, and the 4:2:0 conversion to run ahead.
     fn of(venc: &dyn VideoEncoder) -> Self {
         EncoderInput { untouched: venc.takes_yuv420(), convert: venc.yuv420_input() }
     }

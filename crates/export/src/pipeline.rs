@@ -170,6 +170,9 @@ impl Pipeline {
         self.renderer.as_ref().map_or(requested, |pool| requested.min(i64::try_from(pool.capacity).unwrap_or(i64::MAX)))
     }
 
+    /// Set up the frame pipeline of an export: checks the sequence and settings, and works out the
+    /// output size and placement, render options, colour transform, overlays, frame renderers and
+    /// whether untouched frames can bypass the renderer.
     pub fn new(project: Arc<Project>, seq: ItemId, settings: &ExportSettings, hdr_out: bool) -> Result<Self> {
         let q = project.sequence(seq).ok_or(ExportError::NoSequence)?;
         q.settings.validate().map_err(ExportError::Unsupported)?;

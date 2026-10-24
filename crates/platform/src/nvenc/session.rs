@@ -456,6 +456,8 @@ impl Session {
         Ok(())
     }
 
+    /// Creates one ring slot: an input buffer in the session's format, an NV12 buffer next to it
+    /// for an RGBA session, and a bitstream buffer.
     fn add_slot(&mut self) -> Result<(), String> {
         let (create_in, create_out) = (
             self.api.list.nvEncCreateInputBuffer.ok_or("no nvEncCreateInputBuffer")?,
@@ -666,6 +668,7 @@ impl Session {
 }
 
 impl Drop for Session {
+    /// Destroys every slot's buffers, then the encoder.
     fn drop(&mut self) {
         // SAFETY: every handle was created by this session and is destroyed once, buffers first.
         unsafe {
