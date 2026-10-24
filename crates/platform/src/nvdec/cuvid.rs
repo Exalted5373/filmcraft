@@ -374,9 +374,12 @@ pub struct Session {
     // whose later use would invalidate the pointer the driver holds).
     state: ptr::NonNull<State>,
     parser: *mut c_void,
-    device: Box<Device>,
-    // Dropped after device/context release, and after all cuvid handles have been destroyed.
-    _library: libloading::Library,
+    // Dropped in `Drop`, after the decoder, unless the decoder had to be kept (one of its pictures
+    // may still be in use): then its context stays retained with it.
+    device: std::mem::ManuallyDrop<Box<Device>>,
+    // Unloaded after device/context release and after all cuvid handles have been destroyed; kept
+    // loaded with a decoder that had to be kept.
+    _library: std::mem::ManuallyDrop<libloading::Library>,
 }
 // SAFETY: no callbacks or GPU-memory references outlive an operation. The state allocation and
 // boxed device retain stable addresses across moves; every driver call pushes the context on its
@@ -417,7 +420,7 @@ impl Session {
         })))
         .ok_or("NVDEC state allocation is null")?;
         // From here on `Drop` frees the state, also when creating the parser fails.
-        let mut session = Self { state, parser: ptr::null_mut(), device, _library: library };
+        let mut session = Self { state, parser: ptr::null_mut(), device: std::mem::ManuallyDrop::new(device), _library: std::mem::ManuallyDrop::new(library) };
         session.create_parser()?;
         Ok(session)
     }
@@ -586,12 +589,15 @@ impl Session {
     }
 }
 impl Drop for Session {
-    /// Destroy the parser and the decoder, then free the callback state (leaked instead if the
-    /// parser could not be destroyed, as it would still point at it).
+    /// Destroy the parser and the decoder, free the callback state (leaked instead if the parser
+    /// could not be destroyed, as it would still point at it), then release the CUDA device; a
+    /// decoder that had to be kept keeps its device and context too.
     fn drop(&mut self) {
         if let Err(e) = self.destroy(false) {
             log::warn!("NVDEC cleanup failed: {e}");
         }
+        // SAFETY: as in `state()`; the state is freed only below.
+        let decoder_kept = !unsafe { self.state.as_ref() }.decoder.is_null();
         // A parser that failed to be destroyed is leaked rather than left pointing at freed state.
         if self.parser.is_null() {
             // SAFETY: the pointer came from `Box::into_raw` in `new`, is freed only here, and no parser
@@ -599,6 +605,17 @@ impl Drop for Session {
             drop(unsafe { Box::from_raw(self.state.as_ptr()) });
         } else {
             log::warn!("NVDEC parser could not be destroyed: leaking its state");
+        }
+        if decoder_kept {
+            log::warn!("NVDEC decoder kept: keeping its CUDA device, context and library");
+        } else {
+            // SAFETY: each dropped once, here, as the session's last use of it, the device before
+            // the library; nothing reaches either afterwards (the state pointing at the device is
+            // freed or leaked above).
+            unsafe {
+                std::mem::ManuallyDrop::drop(&mut self.device);
+                std::mem::ManuallyDrop::drop(&mut self._library);
+            }
         }
     }
 }
