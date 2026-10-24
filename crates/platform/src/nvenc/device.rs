@@ -133,9 +133,6 @@ mod cuda {
         stream: Cell<Option<NonNull<c_void>>>,
         /// The stream could not be made: the legacy default stream from then on.
         no_stream: Cell<bool>,
-        /// A wait on the readback stream failed: the GPU may still be reading a mapped picture or
-        /// writing the staging buffer ([`Device::readback_settled`]).
-        unsettled: Cell<bool>,
         _library: libloading::Library,
     }
 
@@ -197,7 +194,6 @@ mod cuda {
                     streams,
                     stream: Cell::new(None),
                     no_stream: Cell::new(false),
-                    unsettled: Cell::new(false),
                     _library: library,
                 })
             }
@@ -253,21 +249,15 @@ mod cuda {
             }
         }
 
-        /// Whether every readback so far was seen to finish. False once a wait on the readback
-        /// stream failed: the GPU may still be reading the mapped picture or writing the staging
-        /// buffer, so the caller must not hand the picture back to the decoder.
-        pub fn readback_settled(&self) -> bool {
-            !self.unsettled.get()
-        }
-
-        /// Wait for the readback stream (if there is one); a failure marks the device unsettled
-        /// ([`Device::readback_settled`]). The context must be current.
-        fn settle(&self) -> Result<(), String> {
+        /// Wait for the readback stream (if there is one): every picture post-processing and copy
+        /// queued on it is done when this returns Ok. An error means that could not be established:
+        /// the GPU may still be reading a mapped picture or writing the staging buffer, so neither
+        /// may be released or reused. The context must be current.
+        pub fn settle_readback(&self) -> Result<(), String> {
             let (Some(stream), Some(api)) = (self.stream.get(), self.streams) else { return Ok(()) };
             // SAFETY: a stream this device created; the context is current and the library loaded.
             let st = unsafe { (api.synchronize)(stream.as_ptr()) };
             if st != 0 {
-                self.unsettled.set(true);
                 return Err(format!("cuStreamSynchronize failed ({st})"));
             }
             Ok(())
@@ -277,8 +267,8 @@ mod cuda {
         /// them to `read`. The bytes land in this device's page-locked staging buffer (grown as
         /// needed and kept for the next copy), on its [`Device::readback_stream`], or in ordinary
         /// memory where page-locked memory cannot be had. CUDA validates the source device range.
-        /// Whatever happens, the readback stream is waited for before this returns; when that wait
-        /// fails the device is no longer [settled](Device::readback_settled).
+        /// Whatever the copy did, the readback stream is waited for before it is read; an error
+        /// from that wait ([`Device::settle_readback`]) means the caller must not release the picture.
         pub fn with_host_copy<R>(&self, source: u64, len: usize, read: impl FnOnce(&[u8]) -> R) -> Result<R, String> {
             source.checked_add(u64::try_from(len).map_err(|_| "CUDA copy length overflows")?).ok_or("CUDA copy address overflows")?;
             let _current = self.push_current()?;
@@ -294,15 +284,15 @@ mod cuda {
                 let stream = self.readback_stream();
                 let copied = match self.streams.filter(|_| !stream.is_null()) {
                     // SAFETY: the copy writes `len <= pinned.len` bytes into the live page-locked
-                    // allocation and is waited for (`settle`) before anything reads, reuses or frees
-                    // it; the stream is this device's, the context is current and the library loaded.
+                    // allocation and is waited for (`settle_readback`) before anything reads, reuses
+                    // or frees it; the stream is this device's, the context is current and the library loaded.
                     Some(api) => unsafe { (api.copy_async)(pinned.ptr.as_ptr().cast(), source, len, stream) },
                     // SAFETY: as above, a synchronous copy.
                     None => unsafe { (self.copy)(pinned.ptr.as_ptr().cast(), source, len) },
                 };
                 // wait even when the copy could not be queued: the stream holds the picture's
                 // post-processing, and nothing may release the picture or the buffer under it
-                if let Err(e) = self.settle() {
+                if let Err(e) = self.settle_readback() {
                     // the GPU may still be writing into the buffer: never read, reuse or free it
                     // (forgetting the pointer leaks it); the next readback allocates another
                     *staging = None;
@@ -318,12 +308,13 @@ mod cuda {
                 let bytes = unsafe { std::slice::from_raw_parts(pinned.ptr.as_ptr(), len) };
                 return Ok(read(bytes));
             }
+            // The picture's post-processing ran on the readback stream if there is one, and the
+            // synchronous copy below (default stream) does not wait for a non-blocking stream: wait
+            // for it before anything else, so no error below returns with it still running.
+            self.settle_readback()?;
             let mut host = Vec::new();
             host.try_reserve_exact(len).map_err(|e| format!("CUDA readback allocation failed: {e}"))?;
             host.resize(len, 0);
-            // The picture's post-processing ran on the readback stream if there is one, and the
-            // synchronous copy below (default stream) does not wait for a non-blocking stream.
-            self.settle()?;
             // SAFETY: the synchronous copy writes at most `host.len()` bytes into the live
             // vector; the context is current and the library loaded.
             let st = unsafe { (self.copy)(host.as_mut_ptr().cast(), source, host.len()) };

@@ -218,10 +218,10 @@ impl State {
         self.mapped.set(Some(address));
         let mapped = Mapped { api: self.api, decoder: self.decoder, address, outstanding: &self.mapped, active: true };
         let frame = self.readback(address, pitch);
-        if frame.is_err() && !device.readback_settled() {
-            // The transfer's end could not be established: keep the picture mapped rather than let
-            // the decoder reuse its surface under it. The error stops the session, and its
-            // teardown retries the unmap (`outstanding`).
+        // Whatever failed, the picture goes back to the decoder only once its post-processing and
+        // any copy of it are done. If that can't be established, it stays mapped instead: the error
+        // stops the session, whose teardown waits again before it unmaps (`outstanding`).
+        if frame.is_err() && device.settle_readback().is_err() {
             mapped.keep();
             return frame.map(|_| ());
         }
@@ -508,26 +508,40 @@ impl Session {
         // run, and they invoke no parser callbacks.
         let state = unsafe { self.state.as_mut() };
         let mut error = None;
+        // A picture left mapped after a failed readback may still be read by the GPU: wait for the
+        // readback stream before unmapping it. If that (or the unmap) fails, the picture stays
+        // mapped and the decoder is kept alive (leaked), so the driver never reuses or frees a
+        // surface still in use.
+        let mut in_use = false;
         if let Some(address) = state.mapped.get() {
-            // SAFETY: retry an outstanding map before releasing its decoder; context is current.
-            match status(unsafe { (state.api.unmap)(state.decoder, address) }, "cuvidUnmapVideoFrame64") {
+            let unmapped = self.device.settle_readback().and_then(|()| {
+                // SAFETY: retry an outstanding map before releasing its decoder; context is current,
+                // and the wait above found no work left on the picture.
+                status(unsafe { (state.api.unmap)(state.decoder, address) }, "cuvidUnmapVideoFrame64")
+            });
+            match unmapped {
                 Ok(()) => state.mapped.set(None),
                 Err(e) => {
+                    in_use = true;
                     error = Some(e);
                 }
             }
         }
         if !keep_decoder && !state.decoder.is_null() {
-            // SAFETY: owned decoder, no host views or callbacks remain; unmapping was attempted
-            // first, and context and library remain live while the driver releases its resources.
-            match status(unsafe { (state.api.destroy_decoder)(state.decoder) }, "cuvidDestroyDecoder") {
-                Ok(()) => {
-                    state.decoder = ptr::null_mut();
-                    state.surfaces = 0;
-                    state.mapped.set(None);
-                }
-                Err(e) => {
-                    error.get_or_insert(e);
+            if in_use {
+                log::warn!("NVDEC decoder kept: one of its pictures may still be in use");
+            } else {
+                // SAFETY: owned decoder, no host views or callbacks remain and no picture of it is
+                // mapped; context and library remain live while the driver releases its resources.
+                match status(unsafe { (state.api.destroy_decoder)(state.decoder) }, "cuvidDestroyDecoder") {
+                    Ok(()) => {
+                        state.decoder = ptr::null_mut();
+                        state.surfaces = 0;
+                        state.mapped.set(None);
+                    }
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
                 }
             }
         }
