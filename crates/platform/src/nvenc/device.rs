@@ -373,9 +373,17 @@ mod cuda {
     }
 
     impl Drop for Device {
-        /// Destroy the readback stream and free the staging buffer while the context is still
-        /// retained, then release the context.
+        /// Wait for the readback stream, then destroy it and free the staging buffer while the
+        /// context is still retained, then release the context. If the wait (or making the context
+        /// current) fails, the GPU may still write the buffer or read a mapped picture: the stream,
+        /// the buffer and the context reference are kept (leaked) instead.
         fn drop(&mut self) {
+            if self.stream.get().is_some()
+                && let Err(e) = self.push_current().and_then(|_current| self.settle_readback())
+            {
+                log::warn!("CUDA device kept: {e}");
+                return;
+            }
             // the stream and the page-locked buffer belong to the context: release them while the
             // context is retained (every copy into the buffer was waited for)
             if let (Some(stream), Some(api)) = (self.stream.take(), self.streams) {
